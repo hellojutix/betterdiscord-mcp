@@ -4,7 +4,7 @@
  * @description Bridge between the Discord client and a Python MCP server.
  *   Reads data from the authenticated client and exposes it to an AI agent.
  *   Self-bot tool — violates Discord ToS. Use at your own risk.
- * @version 0.3.0
+ * @version 0.4.0
  * @source https://github.com/encryrose/betterdiscord-mcp
  */
 
@@ -76,18 +76,36 @@ module.exports = class DiscordMcpBridge {
       byProps("fetchMessages", "receiveMessage") ||
       byProps("fetchMessages", "jumpToMessage") ||
       byProps("fetchMessages");
-    // Server-wide search action creator. Discord's module shape has shifted
-    // across versions, so try several resolution strategies in order.
+    // Server-wide search (native Flux path). Three pieces:
+    //   1. the action creator module (fetchMessages + fetchTabMessages +
+    //      clearSearchMessages siblings),
+    //   2. the FluxDispatcher (dispatch/subscribe/unsubscribe — an export),
+    //   3. the SearchType enum (string enum with GUILD/DMS members).
+    // The action creator dispatches SEARCH_MESSAGES_SUCCESS on the dispatcher;
+    // we subscribe to that to read results, since the underlying REST promise
+    // does not settle from the plugin context.
     this.actions.search =
-      byProps("searchMessages", "queryMessages") ||
-      byProps("searchMessages", "clearSearch") ||
-      byProps("searchMessages") ||
-      // Function-property search: any module exposing a searchMessages fn.
       Webpack.getModule(
-        (m) => m && typeof m.searchMessages === "function"
-      ) ||
-      // getByKeys-style fallback if available on this BdApi build.
-      Webpack.getByKeys?.("searchMessages");
+        (m) =>
+          m &&
+          typeof m.fetchMessages === "function" &&
+          typeof m.fetchTabMessages === "function" &&
+          typeof m.clearSearchMessages === "function"
+      ) || null;
+    this.dispatcher =
+      Webpack.getModule(
+        (m) =>
+          m &&
+          typeof m.dispatch === "function" &&
+          typeof m.subscribe === "function" &&
+          typeof m.unsubscribe === "function",
+        { searchExports: true }
+      ) || null;
+    this.searchType =
+      Webpack.getModule(
+        (m) => m && m.GUILD !== undefined && m.DMS !== undefined,
+        { searchExports: true }
+      ) || null;
   }
 
   // --- WebSocket connection with auto-reconnect ---
@@ -216,13 +234,15 @@ module.exports = class DiscordMcpBridge {
         return {
           guildStore: !!s.guild,
           channelStore: !!s.channel,
-          channelMethods: s.channel
-            ? Object.keys(s.channel).filter((k) => typeof s.channel[k] === "function").slice(0, 40)
-            : [],
           messageStore: !!s.message,
           memberStore: !!s.member,
+          userStore: !!s.user,
+          privateChannelStore: !!s.privateChannel,
+          threadsStore: !!s.threads,
           fetchMessages: !!this.actions.fetchMessages,
-          searchMessages: !!this.actions.search,
+          searchActionCreator: !!this.actions.search,
+          dispatcher: !!this.dispatcher,
+          searchType: this.searchType ? this.searchType.GUILD : null,
         };
       },
 
@@ -306,32 +326,119 @@ module.exports = class DiscordMcpBridge {
       },
 
       searchMessages: async ({ guildId, query, limit }) => {
-        // Resolve the search action creator defensively — the module may
-        // expose searchMessages directly or nested under a property.
-        const mod = this.actions.search;
-        const searchFn =
-          typeof mod?.searchMessages === "function"
-            ? mod.searchMessages.bind(mod)
-            : null;
-        if (!searchFn) {
+        const action = this.actions.search;
+        const disp = this.dispatcher;
+        const stype = this.searchType;
+        if (!action || !disp || !stype) {
           throw new Error(
-            "Search module not found in this Discord version (searchMessages unresolved)"
+            "Search unavailable: the native search modules did not resolve " +
+              "in this Discord version (action creator, dispatcher, or " +
+              "SearchType enum missing)"
           );
         }
-        const res = await searchFn({
-          searchId: guildId,
-          searchType: "guild",
-          query: { content: [query] },
-        });
-        // Response shape: messages is an array of groups [ [msg], ... ].
-        const groups = res?.body?.messages || res?.messages || [];
-        return groups
-          .flat()
-          .slice(0, limit)
-          .map((m) => ({
-            ...this._fmtMessage(m),
-            channel_id: m.channel_id,
-          }));
+
+        const content = String(query || "").trim();
+        if (!content) throw new Error("searchMessages requires a 'query'");
+        const max = Math.min(limit || 25, 25); // Discord returns 25/page.
+
+        // The action creator kicks off the request and, on success, dispatches
+        // SEARCH_MESSAGES_SUCCESS with the results. The underlying REST promise
+        // does not settle from the plugin context, so we listen on the flux
+        // dispatcher for the outcome instead of awaiting a promise.
+        const events = ["SUCCESS", "INDEXING", "FAILURE"].map(
+          (s) => `SEARCH_MESSAGES_${s}`
+        );
+        let done = null; // { kind, payload }
+        const subs = [];
+        for (const name of events) {
+          const cb = (payload) => {
+            // Only accept events for our guild (SUCCESS carries guildId).
+            if (name === "SEARCH_MESSAGES_SUCCESS") {
+              if (payload?.guildId && payload.guildId !== guildId) return;
+              if (!done) done = { kind: "SUCCESS", payload };
+            } else if (name === "SEARCH_MESSAGES_INDEXING") {
+              if (!done) done = { kind: "INDEXING", payload };
+            } else if (name === "SEARCH_MESSAGES_FAILURE") {
+              if (!done) done = { kind: "FAILURE", payload };
+            }
+          };
+          try {
+            disp.subscribe(name, cb);
+            subs.push([name, cb]);
+          } catch {
+            /* ignore individual subscribe failures */
+          }
+        }
+        const cleanup = () => {
+          for (const [name, cb] of subs) {
+            try {
+              disp.unsubscribe(name, cb);
+            } catch {
+              /* ignore */
+            }
+          }
+        };
+
+        const searchContext = { type: stype.GUILD, guildId };
+        // Retry loop: the guild's message index may still be building, in
+        // which case we get INDEXING and should wait, then re-issue.
+        try {
+          const overallDeadline = Date.now() + 30000;
+          let success = null;
+          for (let attempt = 0; attempt < 4; attempt++) {
+            done = null;
+            try {
+              action.fetchMessages({
+                searchContext,
+                searchQueryString: content,
+                pagination: { offset: 0 },
+                searchEverywhere: false,
+              });
+            } catch (e) {
+              throw new Error(
+                `Search call failed: ${e?.message || String(e)}`
+              );
+            }
+            // Wait for one of the outcome events (or a per-attempt timeout).
+            const attemptDeadline = Math.min(Date.now() + 12000, overallDeadline);
+            while (Date.now() < attemptDeadline && !done) {
+              await this._sleep(300);
+            }
+            if (done?.kind === "SUCCESS") {
+              success = done.payload;
+              break;
+            }
+            if (done?.kind === "FAILURE") {
+              throw new Error(
+                `Search failed: ${String(done.payload?.error).slice(0, 200)}`
+              );
+            }
+            // INDEXING or timed out: brief pause, then retry.
+            if (Date.now() >= overallDeadline) break;
+            await this._sleep(2000);
+          }
+
+          if (!success) {
+            throw new Error(
+              "Search did not complete in time; the guild's message index " +
+                "may still be building — try again shortly."
+            );
+          }
+
+          const data = success.data?.[0];
+          const groups = data?.messages || [];
+          // Each group is [message, ...context]; the first entry is the hit.
+          return groups
+            .slice(0, max)
+            .map((g) => (Array.isArray(g) ? g[0] : g))
+            .filter(Boolean)
+            .map((m) => ({
+              ...this._fmtMessage(m),
+              channel_id: m.channel_id,
+            }));
+        } finally {
+          cleanup();
+        }
       },
 
       getMessageByLink: async ({ link }) => {
@@ -474,7 +581,7 @@ module.exports = class DiscordMcpBridge {
         // Lightweight health check that always returns.
         const s = this.stores;
         return {
-          version: "0.3.0",
+          version: "0.4.0",
           modules: {
             guildStore: !!s.guild,
             channelStore: !!s.channel,
@@ -482,7 +589,13 @@ module.exports = class DiscordMcpBridge {
             memberStore: !!s.member,
             userStore: !!s.user,
             fetchMessages: !!this.actions.fetchMessages,
-            search: !!this.actions.search,
+            // Native Flux search: needs the action creator, the dispatcher,
+            // and the SearchType enum together.
+            search:
+              !!this.actions.search && !!this.dispatcher && !!this.searchType,
+            searchActionCreator: !!this.actions.search,
+            dispatcher: !!this.dispatcher,
+            searchType: this.searchType ? this.searchType.GUILD : null,
           },
         };
       },

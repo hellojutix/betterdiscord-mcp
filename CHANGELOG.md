@@ -10,6 +10,28 @@ The plugin (`@version` in `DiscordMcpBridge.plugin.js`) and the Python package
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-03
+
+### Fixed
+- `search_messages` now works. Reworked it to use Discord's native Flux search
+  path instead of a direct REST call: the plugin resolves the search action
+  creator, the FluxDispatcher, and the `SearchType` enum, calls
+  `fetchMessages({searchContext, searchQueryString, pagination})`, and reads
+  results by subscribing to the `SEARCH_MESSAGES_SUCCESS` dispatch (the
+  underlying REST promise never settles from the plugin context). Handles
+  `SEARCH_MESSAGES_INDEXING` (retries while the guild index builds) and
+  `SEARCH_MESSAGES_FAILURE`.
+
+### Changed
+- `ping` and `diagnostics` now report the search sub-modules
+  (`searchActionCreator`, `dispatcher`, `searchType`) instead of the removed
+  HTTP client fields.
+
+### Removed
+- The HTTP-client search fallback. On the tested Discord build the resolved
+  REST client's promises never settle from the plugin context, so it was a
+  dead end; the Flux path replaces it.
+
 ## [0.3.0] - 2026-07-03
 
 ### Added
@@ -27,10 +49,6 @@ The plugin (`@version` in `DiscordMcpBridge.plugin.js`) and the Python package
 ### Changed
 - Reconnect now uses capped exponential backoff (3s → 30s) that resets on a
   successful connection.
-
-### Fixed
-- Search module resolver now resolves across current Discord builds, fixing
-  `search_messages` (previously `searchMessages: false` in diagnostics).
 
 ## [0.2.0] - 2026-07-03
 
