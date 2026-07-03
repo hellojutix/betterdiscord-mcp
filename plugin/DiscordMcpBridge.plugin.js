@@ -4,7 +4,7 @@
  * @description Bridge between the Discord client and a Python MCP server.
  *   Reads data from the authenticated client and exposes it to an AI agent.
  *   Self-bot tool — violates Discord ToS. Use at your own risk.
- * @version 0.4.0
+ * @version 0.5.0
  * @source https://github.com/encryrose/betterdiscord-mcp
  */
 
@@ -63,13 +63,36 @@ module.exports = class DiscordMcpBridge {
       Webpack.getStore?.("PrivateChannelSortStore") ||
       byProps("getSortedPrivateChannels", "getPrivateChannelIds") ||
       byProps("getSortedPrivateChannels");
-    // Threads store — best effort across versions.
+    // Threads store — resolve by the parent-lookup getters it exposes.
+    // These live on the store's prototype, so byProps (which reads the
+    // property directly) picks them up where own-key scans would miss them.
     this.stores.threads =
+      byProps("getThreadsForParent", "getAllThreadsForParent") ||
+      byProps("getThreadsForParent") ||
       Webpack.getStore?.("ThreadsStore") ||
       Webpack.getStore?.("ActiveThreadsStore") ||
       byProps("getActiveJoinedThreadsForGuild", "getAllActiveThreadsForGuild") ||
       byProps("getAllActiveThreadsForGuild") ||
       byProps("getActiveJoinedThreadsForGuild");
+    // Forum/thread loader action creator: loadArchivedThreads dispatches
+    // LOAD_ARCHIVED_THREADS_SUCCESS which populates the threads store.
+    this.actions.loadThreads =
+      byProps("loadArchivedThreads", "loadThreadsBulk") ||
+      byProps("loadArchivedThreads") ||
+      null;
+
+    // Pinned messages: ChannelPinsStore.getPins(channelId) holds the loaded
+    // pins; the action creator's fetchPins() makes the REST call and
+    // dispatches LOAD_PINNED_MESSAGES_SUCCESS to populate the store.
+    this.stores.pins =
+      Webpack.getStore?.("ChannelPinsStore") || byProps("getPins") || null;
+    this.actions.pins =
+      Webpack.getModule(
+        (m) =>
+          m &&
+          typeof m.fetchPins === "function" &&
+          typeof m.pinMessage === "function"
+      ) || null;
 
     // Channel history fetch action: try several module signatures.
     this.actions.fetchMessages =
@@ -243,6 +266,12 @@ module.exports = class DiscordMcpBridge {
           searchActionCreator: !!this.actions.search,
           dispatcher: !!this.dispatcher,
           searchType: this.searchType ? this.searchType.GUILD : null,
+          loadArchivedThreads:
+            typeof this.actions.loadThreads?.loadArchivedThreads === "function",
+          getThreadsForParent:
+            typeof s.threads?.getThreadsForParent === "function",
+          pinsStore: !!s.pins,
+          fetchPins: typeof this.actions.pins?.fetchPins === "function",
         };
       },
 
@@ -519,48 +548,197 @@ module.exports = class DiscordMcpBridge {
         });
       },
 
-      getThreads: ({ channelId, guildId } = {}) => {
+      getThreads: async ({ channelId, guildId } = {}) => {
         const ts = this.stores.threads;
         if (!ts) {
           throw new Error("Threads store not found in this Discord version");
         }
-        let threads = [];
-        // Try guild-wide active thread getters first.
-        if (guildId && typeof ts.getAllActiveThreadsForGuild === "function") {
-          const res = ts.getAllActiveThreadsForGuild(guildId) || {};
-          threads = Array.isArray(res) ? res : Object.values(res).flat();
-        } else if (
-          guildId &&
-          typeof ts.getActiveJoinedThreadsForGuild === "function"
-        ) {
-          const res = ts.getActiveJoinedThreadsForGuild(guildId) || {};
-          // Shape: { channelId: { threadId: thread } }.
-          threads = Object.values(res)
-            .map((v) => Object.values(v || {}))
-            .flat();
-        } else if (
+
+        // Read active threads the store already holds, normalized to an array.
+        const readActive = () => {
+          if (channelId && typeof ts.getThreadsForParent === "function") {
+            const res =
+              ts.getThreadsForParent(channelId) ||
+              ts.getAllThreadsForParent?.(channelId) ||
+              {};
+            return Array.isArray(res) ? res : Object.values(res);
+          }
+          if (guildId && typeof ts.getThreadsForGuild === "function") {
+            const res = ts.getThreadsForGuild(guildId) || {};
+            return Object.values(res)
+              .map((v) => (v && typeof v === "object" ? Object.values(v) : v))
+              .flat();
+          }
+          return null;
+        };
+
+        let threads = readActive();
+
+        // Forum/archived posts don't live in the active store. Fetch them via
+        // the action creator (Discord makes the REST call) and capture the
+        // LOAD_ARCHIVED_THREADS_SUCCESS dispatch payload directly — same
+        // pattern used for search. The payload carries the threads AND their
+        // first message, so we attach a content preview to each post.
+        let firstMessages = null;
+        if (
           channelId &&
-          typeof ts.getActiveUnjoinedThreadsForParent === "function"
+          (threads === null || threads.length === 0) &&
+          this.dispatcher &&
+          this.actions.loadThreads &&
+          typeof this.actions.loadThreads.loadArchivedThreads === "function"
         ) {
-          const res = ts.getActiveUnjoinedThreadsForParent(channelId) || {};
-          threads = Array.isArray(res) ? res : Object.values(res);
-        } else {
+          const ch = this.stores.channel?.getChannel?.(channelId);
+          const gid = guildId || ch?.guild_id;
+          const disp = this.dispatcher;
+          let captured = null;
+          const onSuccess = (payload) => {
+            if (!payload || payload.channelId !== channelId) return;
+            captured = payload;
+          };
+          disp.subscribe("LOAD_ARCHIVED_THREADS_SUCCESS", onSuccess);
+          try {
+            try {
+              this.actions.loadThreads.loadArchivedThreads({
+                guildId: gid,
+                channelId,
+                sortOrder: 0,
+                tagFilter: new Set(),
+                tagSetting: "match_some",
+                offset: 0,
+              });
+            } catch {
+              // Ignore synchronous throws; we poll for the dispatch below.
+            }
+            const deadline = Date.now() + 12000;
+            while (Date.now() < deadline && !captured) {
+              await this._sleep(300);
+            }
+          } finally {
+            disp.unsubscribe("LOAD_ARCHIVED_THREADS_SUCCESS", onSuccess);
+          }
+          if (captured && Array.isArray(captured.threads)) {
+            threads = captured.threads;
+            // firstMessages: array of message objects; index by their channel_id
+            // (a forum post's message channel_id equals the post/thread id).
+            const fm = captured.firstMessages;
+            if (Array.isArray(fm)) {
+              firstMessages = {};
+              for (const m of fm) {
+                if (m && m.channel_id) firstMessages[m.channel_id] = m;
+              }
+            }
+          }
+        }
+
+        if (threads === null) {
           throw new Error(
             "No compatible thread getter found; pass guildId or channelId"
           );
         }
+
         // Optionally narrow to a specific parent channel.
         if (channelId) {
           threads = threads.filter(
             (t) => t.parent_id === channelId || t.parentId === channelId
           );
         }
-        return threads.map((t) => ({
-          id: t.id,
-          name: t.name,
-          parent_id: t.parent_id ?? t.parentId ?? null,
-          archived: !!(t.threadMetadata?.archived ?? t.archived),
+        return threads.map((t) => {
+          const out = {
+            id: t.id,
+            name: t.name,
+            parent_id: t.parent_id ?? t.parentId ?? null,
+            archived: !!(t.threadMetadata?.archived ?? t.archived),
+            message_count: t.messageCount ?? t.message_count ?? null,
+          };
+          const first = firstMessages?.[t.id];
+          if (first) {
+            out.first_message = {
+              author:
+                first.author?.global_name ||
+                first.author?.username ||
+                first.author?.id ||
+                null,
+              content: (first.content || "").slice(0, 500),
+              timestamp: first.timestamp ?? null,
+              attachments: (first.attachments || []).map((a) => a.url),
+            };
+          }
+          return out;
+        });
+      },
+
+      getPins: async ({ channelId }) => {
+        if (!channelId) throw new Error("getPins requires a 'channelId'");
+        const store = this.stores.pins;
+        if (!store || typeof store.getPins !== "function") {
+          throw new Error("Pins store not found in this Discord version");
+        }
+
+        const read = () => {
+          const state = store.getPins(channelId);
+          return state && Array.isArray(state.items) ? state.items : null;
+        };
+
+        let items = read();
+        // Pins load lazily. If nothing cached and we have the loader, fetch and
+        // wait for LOAD_PINNED_MESSAGES_SUCCESS to populate the store.
+        if (
+          (items === null || items.length === 0) &&
+          this.actions.pins &&
+          typeof this.actions.pins.fetchPins === "function" &&
+          this.dispatcher
+        ) {
+          const disp = this.dispatcher;
+          let done = false;
+          const cb = (p) => {
+            if (p && p.channelId === channelId) done = true;
+          };
+          disp.subscribe("LOAD_PINNED_MESSAGES_SUCCESS", cb);
+          try {
+            try {
+              this.actions.pins.fetchPins(channelId, { reset: true, limit: 50 });
+            } catch {
+              // Ignore synchronous throws; poll for the dispatch below.
+            }
+            const deadline = Date.now() + 10000;
+            while (Date.now() < deadline && !done) {
+              await this._sleep(300);
+            }
+          } finally {
+            disp.unsubscribe("LOAD_PINNED_MESSAGES_SUCCESS", cb);
+          }
+          items = read() || [];
+        }
+
+        if (items === null) items = [];
+        // Each item is { pinnedAt, message }. Newest pins come first.
+        return items.map((it) => ({
+          pinned_at: it.pinnedAt?.toString?.() ?? it.pinnedAt ?? null,
+          ...this._fmtMessage(it.message || it),
         }));
+      },
+
+      getChannelInfo: ({ channelId }) => {
+        if (!channelId) throw new Error("getChannelInfo requires a 'channelId'");
+        const c = this.stores.channel?.getChannel?.(channelId);
+        if (!c) {
+          throw new Error(`Channel ${channelId} not found in cache`);
+        }
+        return {
+          id: c.id,
+          name: c.name ?? null,
+          type: c.type,
+          guild_id: c.guild_id ?? null,
+          parent_id: c.parent_id ?? null,
+          topic: c.topic ?? null,
+          nsfw: !!c.nsfw,
+          // Thread-specific fields when this channel is a thread/forum post.
+          owner_id: c.ownerId ?? c.owner_id ?? null,
+          message_count: c.messageCount ?? c.message_count ?? null,
+          member_count: c.memberCount ?? c.member_count ?? null,
+          archived: c.threadMetadata?.archived ?? null,
+          last_message_id: c.lastMessageId ?? c.last_message_id ?? null,
+        };
       },
 
       getUserInfo: ({ userId }) => {
@@ -581,7 +759,7 @@ module.exports = class DiscordMcpBridge {
         // Lightweight health check that always returns.
         const s = this.stores;
         return {
-          version: "0.4.0",
+          version: "0.5.0",
           modules: {
             guildStore: !!s.guild,
             channelStore: !!s.channel,
@@ -596,6 +774,12 @@ module.exports = class DiscordMcpBridge {
             searchActionCreator: !!this.actions.search,
             dispatcher: !!this.dispatcher,
             searchType: this.searchType ? this.searchType.GUILD : null,
+            threadsStore: !!s.threads,
+            loadArchivedThreads:
+              typeof this.actions.loadThreads?.loadArchivedThreads ===
+              "function",
+            pinsStore: !!s.pins,
+            fetchPins: typeof this.actions.pins?.fetchPins === "function",
           },
         };
       },

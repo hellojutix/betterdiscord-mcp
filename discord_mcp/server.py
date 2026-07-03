@@ -191,17 +191,74 @@ async def list_dms() -> list[dict]:
 async def list_threads(
     channel_id: str | None = None, guild_id: str | None = None
 ) -> list[dict]:
-    """Список активных веток (threads).
+    """Список веток (threads) или постов форума.
+
+    Для форум-каналов и обычных каналов с ветками подгружает архивные посты
+    родным механизмом клиента, если их ещё нет в кэше (нужен channel_id).
 
     Args:
-        channel_id: id канала-родителя (необязательно).
+        channel_id: id канала-родителя (для форумов — обязателен).
         guild_id: id сервера (необязательно).
 
-    Возвращает id, name, parent_id и archived каждой ветки.
+    Возвращает id, name, parent_id, archived, message_count и — если доступно —
+    first_message (автор, текст, вложения первого сообщения поста).
     """
     return await _bridge.call(
         "getThreads", {"channelId": channel_id, "guildId": guild_id}
     )
+
+
+@mcp.tool()
+async def read_thread(thread_id: str, limit: int = 100) -> list[dict]:
+    """Прочитать сообщения ветки/поста форума по-порядку (старые сверху).
+
+    Ветка в Discord — это тоже канал, её id совпадает с id первого сообщения
+    поста (из list_threads). Удобно для чтения тредов и форумных постов:
+    возвращает сообщения в хронологическом порядке (в отличие от get_messages,
+    который отдаёт свежие сверху).
+
+    Args:
+        thread_id: id ветки/поста (поле id из list_threads).
+        limit: сколько сообщений вернуть (макс. 500).
+
+    Возвращает список сообщений в порядке от старых к новым.
+    """
+    limit = max(1, min(limit, 500))
+    msgs = await _bridge.call(
+        "fetchMessages",
+        {"channelId": thread_id, "limit": limit},
+        timeout=60.0,
+    )
+    # fetchMessages отдаёт свежие сверху — переворачиваем в хронологию.
+    return list(reversed(msgs)) if isinstance(msgs, list) else msgs
+
+
+@mcp.tool()
+async def get_pins(channel_id: str) -> list[dict]:
+    """Закреплённые сообщения канала или ветки.
+
+    Подгружает пины родным механизмом клиента, если они ещё не в кэше.
+
+    Args:
+        channel_id: id канала или ветки.
+
+    Возвращает список закреплённых сообщений (поле pinned_at + обычные поля
+    сообщения), самые свежие пины сверху.
+    """
+    return await _bridge.call("getPins", {"channelId": channel_id}, timeout=30.0)
+
+
+@mcp.tool()
+async def get_channel_info(channel_id: str) -> dict:
+    """Информация о канале или ветке по id.
+
+    Args:
+        channel_id: id канала или ветки.
+
+    Возвращает id, name, type, guild_id, parent_id, topic и — для веток —
+    owner_id, message_count, member_count, archived, last_message_id.
+    """
+    return await _bridge.call("getChannelInfo", {"channelId": channel_id})
 
 
 @mcp.tool()

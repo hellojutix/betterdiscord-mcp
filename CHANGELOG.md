@@ -10,6 +10,28 @@ The plugin (`@version` in `DiscordMcpBridge.plugin.js`) and the Python package
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-03
+
+### Added
+- `read_thread` — read a thread or forum post's messages in chronological
+  order (oldest first), a convenience wrapper over the message fetch.
+- `get_pins` — list a channel's or thread's pinned messages. The plugin
+  resolves `ChannelPinsStore` and the `fetchPins` action creator, lazily loads
+  pins via a REST call, and reads them by subscribing to the
+  `LOAD_PINNED_MESSAGES_SUCCESS` dispatch.
+- `get_channel_info` — metadata for a channel or thread (name, type, guild,
+  parent, topic, and thread fields: owner, message/member counts, archived).
+
+### Changed
+- `list_threads` now loads forum/archived posts that aren't cached. It calls
+  the `loadArchivedThreads` action creator and captures the
+  `LOAD_ARCHIVED_THREADS_SUCCESS` dispatch payload directly (the REST promise
+  never settles from the plugin context), so forum channels return their posts.
+  Each thread now also includes `message_count` and, when available,
+  `first_message` (the post's opening message: author, content, attachments).
+- `ping` and `diagnostics` now also report the threads/pins modules
+  (`threadsStore`, `loadArchivedThreads`, `pinsStore`, `fetchPins`).
+
 ## [0.4.0] - 2026-07-03
 
 ### Fixed

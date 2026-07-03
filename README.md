@@ -103,7 +103,10 @@ already-authenticated client.
 | `search_messages` | Native Discord search across a server |
 | `get_message_by_link` | Fetch a single message from a Discord message link |
 | `list_dms` | List the account's direct and group DMs |
-| `list_threads` | List active threads (by channel or guild) |
+| `list_threads` | List threads or forum posts (loads uncached forum posts; includes `first_message`) |
+| `read_thread` | Read a thread / forum post's messages in chronological order |
+| `get_pins` | List a channel's or thread's pinned messages |
+| `get_channel_info` | Metadata for a channel or thread |
 | `list_members` | Members currently known to the client |
 | `get_user_info` | Look up a user by id |
 | `export_channel` | Dump a channel's history to `exports/*.json` |
