@@ -10,6 +10,28 @@ The plugin (`@version` in `DiscordMcpBridge.plugin.js`) and the Python package
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-03
+
+### Added
+- New tools / plugin methods: `ping` (lightweight health check with plugin
+  version and resolved-module map), `get_message_by_link`, `list_dms`,
+  `list_threads`, `get_user_info`.
+- `get_messages` gained `author_id` and `after` filters.
+- Richer message payloads: `embeds`, `reactions`, `edited_timestamp`,
+  `pinned`, and a summarized `referenced_message` for replies.
+- Settings panel in the plugin to configure the bridge port from the Discord
+  UI (persisted via `BdApi.Data`).
+- Dev tooling: pytest smoke tests for the bridge, `ruff` lint config, and a
+  GitHub Actions CI workflow (Python tests + JS syntax check).
+
+### Changed
+- Reconnect now uses capped exponential backoff (3s → 30s) that resets on a
+  successful connection.
+
+### Fixed
+- Search module resolver now resolves across current Discord builds, fixing
+  `search_messages` (previously `searchMessages: false` in diagnostics).
+
 ## [0.2.0] - 2026-07-03
 
 ### Added

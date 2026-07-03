@@ -10,11 +10,10 @@ import json
 import os
 import pathlib
 from contextlib import asynccontextmanager
-from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .bridge import Bridge, BridgeError
+from .bridge import Bridge
 
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8787"))
 EXPORT_DIR = pathlib.Path(__file__).resolve().parent.parent / "exports"
@@ -83,7 +82,11 @@ async def list_channels(guild_id: str) -> list[dict]:
 
 @mcp.tool()
 async def get_messages(
-    channel_id: str, limit: int = 100, before: str | None = None
+    channel_id: str,
+    limit: int = 100,
+    before: str | None = None,
+    author_id: str | None = None,
+    after: str | None = None,
 ) -> list[dict]:
     """Прочитать историю сообщений канала (с догрузкой через API клиента).
 
@@ -96,13 +99,22 @@ async def get_messages(
         limit: сколько сообщений вернуть (макс. рекомендованно 500 за раз,
             чтобы не создавать лишний трафик).
         before: вернуть сообщения старше этого message id (для пагинации).
+        author_id: оставить только сообщения этого автора (id пользователя).
+        after: вернуть сообщения новее этого message id (snowflake).
 
-    Возвращает список сообщений: id, author, content, timestamp, attachments.
+    Возвращает список сообщений: id, author, content, timestamp, attachments,
+    embeds, reactions, edited_timestamp, pinned, referenced_message.
     """
     limit = max(1, min(limit, 500))
     return await _bridge.call(
         "fetchMessages",
-        {"channelId": channel_id, "limit": limit, "before": before},
+        {
+            "channelId": channel_id,
+            "limit": limit,
+            "before": before,
+            "authorId": author_id,
+            "after": after,
+        },
         timeout=60.0,
     )
 
@@ -139,6 +151,69 @@ async def list_members(guild_id: str) -> list[dict]:
         guild_id: id сервера.
     """
     return await _bridge.call("getMembers", {"guildId": guild_id})
+
+
+@mcp.tool()
+async def ping() -> dict:
+    """Лёгкая проверка здоровья плагина.
+
+    Возвращает версию плагина и карту найденных внутренних модулей Discord.
+    Работает всегда, если плагин подключён — удобно для быстрой диагностики.
+    """
+    return await _bridge.call("ping")
+
+
+@mcp.tool()
+async def get_message_by_link(link: str) -> dict:
+    """Получить одно сообщение по ссылке Discord.
+
+    Args:
+        link: ссылка вида
+            https://discord.com/channels/<guildId>/<channelId>/<messageId>
+            (поддерживаются также ptb./canary. и discordapp.com).
+
+    Возвращает то же представление сообщения, что и get_messages.
+    """
+    return await _bridge.call("getMessageByLink", {"link": link})
+
+
+@mcp.tool()
+async def list_dms() -> list[dict]:
+    """Список личных и групповых переписок (DM) текущего аккаунта.
+
+    Возвращает id, type, name и список участников (recipients) каждой личной
+    или групповой переписки.
+    """
+    return await _bridge.call("getDMs")
+
+
+@mcp.tool()
+async def list_threads(
+    channel_id: str | None = None, guild_id: str | None = None
+) -> list[dict]:
+    """Список активных веток (threads).
+
+    Args:
+        channel_id: id канала-родителя (необязательно).
+        guild_id: id сервера (необязательно).
+
+    Возвращает id, name, parent_id и archived каждой ветки.
+    """
+    return await _bridge.call(
+        "getThreads", {"channelId": channel_id, "guildId": guild_id}
+    )
+
+
+@mcp.tool()
+async def get_user_info(user_id: str) -> dict:
+    """Информация о пользователе по id.
+
+    Args:
+        user_id: id пользователя.
+
+    Возвращает id, username, global_name, bot и avatar.
+    """
+    return await _bridge.call("getUserInfo", {"userId": user_id})
 
 
 @mcp.tool()

@@ -1,4 +1,4 @@
-# discord-mcp
+# betterdiscord-mcp
 
 An MCP server that lets an AI agent (like Claude) read data from Discord
 servers through your own account. It pairs with a BetterDiscord plugin, so
@@ -39,8 +39,8 @@ via the Developer Portal instead.
 **1. Python server (via uv):**
 
 ```bash
-git clone https://github.com/<your-username>/discord-mcp.git
-cd discord-mcp
+git clone https://github.com/encryrose/betterdiscord-mcp.git
+cd betterdiscord-mcp
 uv sync
 ```
 
@@ -59,7 +59,7 @@ uv sync
 Claude Code (CLI):
 
 ```bash
-claude mcp add discord -- uv --directory /path/to/discord-mcp run discord-mcp
+claude mcp add discord -- uv --directory /path/to/betterdiscord-mcp run discord-mcp
 ```
 
 Claude Desktop — add to `claude_desktop_config.json`:
@@ -69,13 +69,13 @@ Claude Desktop — add to `claude_desktop_config.json`:
   "mcpServers": {
     "discord": {
       "command": "uv",
-      "args": ["--directory", "/path/to/discord-mcp", "run", "discord-mcp"]
+      "args": ["--directory", "/path/to/betterdiscord-mcp", "run", "discord-mcp"]
     }
   }
 }
 ```
 
-Replace `/path/to/discord-mcp` with the absolute path where you cloned the
+Replace `/path/to/betterdiscord-mcp` with the absolute path where you cloned the
 repo. If `uv` is not on your client's PATH, use the full path to the `uv`
 executable in `command`.
 
@@ -95,12 +95,17 @@ already-authenticated client.
 | Tool | Purpose |
 |------|---------|
 | `bridge_status` | Check whether the plugin is connected |
+| `ping` | Lightweight health check: plugin version + resolved-module map |
 | `diagnostics` | Show which internal Discord modules resolved (debugging) |
 | `list_guilds` | List servers the client can see |
 | `list_channels` | List a server's text channels |
-| `get_messages` | Read a channel's history (paginate with `before`) |
+| `get_messages` | Read a channel's history (paginate with `before`; filter by `author_id` / `after`) |
 | `search_messages` | Native Discord search across a server |
+| `get_message_by_link` | Fetch a single message from a Discord message link |
+| `list_dms` | List the account's direct and group DMs |
+| `list_threads` | List active threads (by channel or guild) |
 | `list_members` | Members currently known to the client |
+| `get_user_info` | Look up a user by id |
 | `export_channel` | Dump a channel's history to `exports/*.json` |
 
 ## Typical flow
@@ -117,6 +122,57 @@ Start with `bridge_status`. If connected: `list_guilds` → `list_channels`
   see what resolved, then fix the module filters.
 - **Empty history** — Scroll the channel manually once so the client loads
   messages, then retry.
+
+## Development
+
+Install the project together with its dev tooling (pytest, pytest-asyncio,
+ruff):
+
+```bash
+uv sync --group dev
+```
+
+Run the test suite:
+
+```bash
+uv run pytest
+```
+
+Lint the code:
+
+```bash
+uv run ruff check .
+```
+
+The tests live in `tests/` and exercise the WebSocket bridge
+(`discord_mcp.bridge.Bridge`) directly: they start the server on an unusual
+port, connect a fake plugin with the `websockets` client, and assert that a
+JSON-RPC round-trip returns the expected result. No real Discord client is
+needed.
+
+### Registering with Claude Code
+
+Once installed, register the server with Claude Code:
+
+```bash
+claude mcp add discord -- uv --directory /path/to/betterdiscord-mcp run discord-mcp
+```
+
+Replace `/path/to/betterdiscord-mcp` with the absolute path to your clone.
+
+### Continuous integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull
+request with two jobs:
+
+- **python** — installs [uv](https://docs.astral.sh/uv/), runs
+  `uv sync --group dev`, then `uv run ruff check .` and `uv run pytest -q`.
+- **plugin-syntax** — validates the BetterDiscord plugin with
+  `node --check plugin/DiscordMcpBridge.plugin.js`.
+
+## Screenshots
+
+_TODO: add a short GIF of the agent reading a channel._
 
 ## License
 
