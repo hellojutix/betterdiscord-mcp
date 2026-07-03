@@ -1,12 +1,14 @@
 /**
  * @name DiscordMcpBridge
  * @author you
- * @description Мост между Discord-клиентом и Python MCP-сервером. Читает
- *   данные из клиента и отдаёт их агенту. Используется на свой риск.
- * @version 0.1.0
+ * @description Bridge between the Discord client and a Python MCP server.
+ *   Reads data from the authenticated client and exposes it to an AI agent.
+ *   Self-bot tool — violates Discord ToS. Use at your own risk.
+ * @version 0.2.0
+ * @source https://github.com/<your-username>/betterdiscord-mcp
  */
 
-const BRIDGE_PORT = 8787; // должен совпадать с BRIDGE_PORT в .env
+const BRIDGE_PORT = 8787; // must match BRIDGE_PORT in .env
 const BRIDGE_URL = `ws://127.0.0.1:${BRIDGE_PORT}`;
 
 module.exports = class DiscordMcpBridge {
@@ -20,7 +22,7 @@ module.exports = class DiscordMcpBridge {
   start() {
     this._resolveModules();
     this._connect();
-    BdApi.UI.showToast("DiscordMcpBridge запущен", { type: "info" });
+    BdApi.UI.showToast("DiscordMcpBridge started", { type: "info" });
   }
 
   stop() {
@@ -32,11 +34,11 @@ module.exports = class DiscordMcpBridge {
     }
   }
 
-  // --- Поиск внутренних модулей Discord через Webpack ---
+  // --- Resolve Discord's internal modules via Webpack ---
   _resolveModules() {
     const { Webpack } = BdApi;
     const byProps = (...p) => Webpack.getModule((m) => p.every((k) => m?.[k]));
-    // Надёжный способ — сторы по имени. С фолбэком на поиск по свойствам.
+    // Prefer resolving stores by name; fall back to property search.
     const store = (name, ...props) =>
       Webpack.getStore?.(name) || byProps(...props);
 
@@ -50,17 +52,17 @@ module.exports = class DiscordMcpBridge {
     this.stores.user = store("UserStore", "getUser", "getCurrentUser");
     this.stores.member = store("GuildMemberStore", "getMember", "getMembers");
 
-    // Экшен догрузки истории канала: пробуем несколько сигнатур модуля.
+    // Channel history fetch action: try several module signatures.
     this.actions.fetchMessages =
       byProps("fetchMessages", "receiveMessage") ||
       byProps("fetchMessages", "jumpToMessage") ||
       byProps("fetchMessages");
-    // Поиск по серверу.
+    // Server-wide search.
     this.actions.search =
       byProps("searchMessages", "queryMessages") || byProps("searchMessages");
   }
 
-  // --- WebSocket-соединение с автопереподключением ---
+  // --- WebSocket connection with auto-reconnect ---
   _connect() {
     try {
       this.ws = new WebSocket(BRIDGE_URL);
@@ -68,7 +70,7 @@ module.exports = class DiscordMcpBridge {
       return this._scheduleReconnect();
     }
     this.ws.onopen = () =>
-      BdApi.UI.showToast("MCP-мост подключён", { type: "success" });
+      BdApi.UI.showToast("MCP bridge connected", { type: "success" });
     this.ws.onclose = () => this._scheduleReconnect();
     this.ws.onerror = () => {};
     this.ws.onmessage = (ev) => this._onMessage(ev.data);
@@ -99,14 +101,13 @@ module.exports = class DiscordMcpBridge {
     }
   }
 
-  // Реализация методов дальше во второй части файла.
   _dispatch(method, params) {
     const fn = this._handlers()[method];
-    if (!fn) throw new Error(`Неизвестный метод: ${method}`);
+    if (!fn) throw new Error(`Unknown method: ${method}`);
     return fn(params);
   }
 
-  // --- Утилиты форматирования ---
+  // --- Formatting helpers ---
   _fmtMessage(m) {
     return {
       id: m.id,
@@ -126,7 +127,7 @@ module.exports = class DiscordMcpBridge {
     return new Promise((r) => setTimeout(r, ms));
   }
 
-  // --- Обработчики методов, вызываемых с Python-стороны ---
+  // --- Method handlers called from the Python side ---
   _handlers() {
     return {
       getGuilds: () => {
@@ -138,7 +139,7 @@ module.exports = class DiscordMcpBridge {
       },
 
       diag: () => {
-        // Диагностика: что из модулей реально нашлось.
+        // Diagnostics: which modules actually resolved.
         const s = this.stores;
         return {
           guildStore: !!s.guild,
@@ -155,7 +156,7 @@ module.exports = class DiscordMcpBridge {
 
       getChannels: ({ guildId }) => {
         const st = this.stores.channel;
-        // В разных версиях метод называется по-разному — пробуем по порядку.
+        // Method name varies across versions — try each in order.
         let all =
           st.getMutableGuildChannels?.() ||
           st.getMutableGuildChannelsForGuild?.(guildId) ||
@@ -181,7 +182,7 @@ module.exports = class DiscordMcpBridge {
       },
 
       fetchMessages: async ({ channelId, limit, before }) => {
-        // Сначала пробуем то, что уже в сторе.
+        // Start from whatever is already in the store.
         let cached = this.stores.message.getMessages(channelId);
         let arr = cached?.toArray ? cached.toArray() : [];
 
@@ -193,13 +194,13 @@ module.exports = class DiscordMcpBridge {
             limit: Math.min(limit, 100),
             before: before || undefined,
           };
-          // Важно вызывать как метод модуля, чтобы не потерять `this`.
+          // Call as a module method so `this` is not lost.
           if (typeof mod.fetchMessages === "function") {
             await mod.fetchMessages(opts);
           } else {
             await mod(opts);
           }
-          await this._sleep(800); // дать сторy обновиться
+          await this._sleep(800); // let the store update
           cached = this.stores.message.getMessages(channelId);
           arr = cached?.toArray ? cached.toArray() : [];
         }
@@ -209,8 +210,8 @@ module.exports = class DiscordMcpBridge {
           const idx = msgs.findIndex((m) => m.id === before);
           if (idx >= 0) msgs = msgs.slice(0, idx);
         }
-        // Discord держит по возрастанию времени — берём последние limit,
-        // возвращаем от новых к старым.
+        // Discord keeps messages oldest-first — take the last `limit`
+        // and return them newest-first.
         return msgs
           .slice(-limit)
           .reverse()
@@ -219,14 +220,14 @@ module.exports = class DiscordMcpBridge {
 
       searchMessages: async ({ guildId, query, limit }) => {
         if (!this.actions.search?.searchMessages) {
-          throw new Error("Модуль поиска не найден в этой версии Discord");
+          throw new Error("Search module not found in this Discord version");
         }
         const res = await this.actions.search.searchMessages({
           searchId: guildId,
           searchType: "guild",
           query: { content: [query] },
         });
-        // Структура ответа: messages — массив групп [ [msg], ... ].
+        // Response shape: messages is an array of groups [ [msg], ... ].
         const groups = res?.body?.messages || res?.messages || [];
         return groups
           .flat()
