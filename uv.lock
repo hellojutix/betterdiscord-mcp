@@ -231,9 +231,10 @@ wheels = [
 
 [[package]]
 name = "discord-mcp"
-version = "0.5.1"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "mcp", extra = ["cli"] },
     { name = "websockets" },
 ]
@@ -247,6 +248,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.24.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.2.0" },
     { name = "websockets", specifier = ">=12.0" },
 ]

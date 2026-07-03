@@ -4,7 +4,7 @@
  * @description Bridge between the Discord client and a Python MCP server.
  *   Reads data from the authenticated client and exposes it to an AI agent.
  *   Self-bot tool — violates Discord ToS. Use at your own risk.
- * @version 0.5.1
+ * @version 0.6.0
  * @source https://github.com/encryrose/betterdiscord-mcp
  */
 
@@ -129,6 +129,141 @@ module.exports = class DiscordMcpBridge {
         (m) => m && m.GUILD !== undefined && m.DMS !== undefined,
         { searchExports: true }
       ) || null;
+
+    // --- v0.6.0 stores ---
+    // Roles: getRole/getRoles live on the store prototype.
+    this.stores.role =
+      store("RoleStore", "getRole", "getRoles") ||
+      Webpack.getStore?.("GuildRoleStore") ||
+      byProps("getRole", "getRoles") ||
+      byProps("getRoles");
+    // Custom emoji lookup (for humanize + reaction resolution).
+    this.stores.emoji =
+      byProps("getCustomEmoji", "getEmojiById") ||
+      byProps("getCustomEmoji") ||
+      Webpack.getStore?.("EmojiStore");
+    // Presence store — approximate online count for guild info.
+    this.stores.presence =
+      Webpack.getStore?.("PresenceStore") ||
+      byProps("getGuildPresenceCount") ||
+      byProps("getPresences", "getGuildPresences");
+    // Reactions store for getReactions. Reactors are loaded lazily; when the
+    // store is empty we fall back to the internal HTTP module (below).
+    this.stores.reactions =
+      Webpack.getStore?.("ReactionsStore") ||
+      byProps("getReactions", "getUserReactionIds") ||
+      byProps("getReactions") ||
+      null;
+    this.actions.reactions =
+      Webpack.getModule((m) => m && typeof m.fetchReactions === "function") ||
+      null;
+    // Discord's internal REST client (get/post/put/patch/del). Used as an
+    // awaitable fallback for data the stores don't cache (e.g. reactors). The
+    // auth token lives inside this module and never leaves the client.
+    this.actions.http =
+      Webpack.getModule(
+        (m) =>
+          m &&
+          typeof m.get === "function" &&
+          typeof m.post === "function" &&
+          typeof m.patch === "function" &&
+          typeof m.put === "function"
+      ) ||
+      Webpack.getModule(
+        (m) => m && m.default && typeof m.default.get === "function" &&
+          typeof m.default.post === "function"
+      )?.default ||
+      null;
+  }
+
+  // --- Role lookup helper (v0.6.0) ---
+  // Role storage moved across Discord versions: some builds expose
+  // RoleStore.getRoles(guildId), others keep roles on GuildStore
+  // (getRoles(guildId) or the guild record's `.roles` map). Try each and
+  // return a { roleId: roleObject } map (possibly empty). Never throws.
+  _getGuildRoles(guildId) {
+    const r = this.stores.role;
+    // Method names vary by version. getRoles(guildId) existed in older
+    // builds; current builds expose getRolesSnapshot / getUnsafeMutableRoles
+    // (a { roleId: role } map) or getSortedRoles (an array). Try each and
+    // normalize to a { roleId: role } map.
+    const sources = [
+      () => r?.getRoles?.(guildId),
+      () => r?.getRolesSnapshot?.(guildId),
+      () => r?.getUnsafeMutableRoles?.(guildId),
+      () => r?.getSortedRoles?.(guildId),
+      () => this.stores.guild?.getGuild?.(guildId)?.roles,
+    ];
+    for (const get of sources) {
+      let roles;
+      try {
+        roles = get();
+      } catch {
+        continue;
+      }
+      if (!roles) continue;
+      // Normalize an array of role objects into a { id: role } map.
+      if (Array.isArray(roles)) {
+        if (!roles.length) continue;
+        const map = {};
+        for (const role of roles) if (role && role.id) map[role.id] = role;
+        if (Object.keys(map).length) return map;
+        continue;
+      }
+      if (typeof roles === "object" && Object.keys(roles).length) return roles;
+    }
+    return {};
+  }
+
+  // Channel map for a guild, trying the method names that vary by version.
+  _guildChannelMap(guildId) {
+    const st = this.stores.channel;
+    if (!st) return {};
+    try {
+      return (
+        st.getMutableGuildChannels?.() ||
+        st.getMutableGuildChannelsForGuild?.(guildId) ||
+        st.getAllChannels?.() ||
+        {}
+      );
+    } catch {
+      return {};
+    }
+  }
+
+  // --- Humanize helper (v0.6.0) ---
+  // Replace Discord entity mentions with readable text. Never throws; any
+  // unresolved entity is left with its original syntax intact.
+  _humanizeContent(content, { channelId, guildId } = {}) {
+    if (!content || typeof content !== "string") return content;
+    const re = /<#(\d+)>|<@!?(\d+)>|<@&(\d+)>|<a?:(\w+):(\d+)>/g;
+    return content.replace(
+      re,
+      (whole, chId, userId, roleId, emojiName /*, emojiId */) => {
+        try {
+          if (chId) {
+            const ch = this.stores.channel?.getChannel?.(chId);
+            return ch?.name ? `#${ch.name}` : whole;
+          }
+          if (userId) {
+            const u = this.stores.user?.getUser?.(userId);
+            return u?.username ? `@${u.username}` : whole;
+          }
+          if (roleId) {
+            if (!guildId) return whole; // DM / no guild context
+            const roles = this.stores.role?.getRoles?.(guildId);
+            const r = roles?.[roleId];
+            return r?.name ? `@${r.name}` : whole;
+          }
+          if (emojiName) {
+            return `:${emojiName}:`;
+          }
+        } catch {
+          return whole;
+        }
+        return whole;
+      }
+    );
   }
 
   // --- WebSocket connection with auto-reconnect ---
@@ -260,7 +395,7 @@ module.exports = class DiscordMcpBridge {
     return templates[idx].replace("%user%", who);
   }
 
-  _fmtMessage(m) {
+  _fmtMessage(m, opts) {
     // Summarize a reply reference when the message is a reply.
     let referenced = null;
     const ref = m.referenced_message || m.messageReference;
@@ -282,7 +417,7 @@ module.exports = class DiscordMcpBridge {
 
     const systemText = this._systemText(m);
 
-    return {
+    const out = {
       id: m.id,
       author: m.author
         ? { id: m.author.id, username: m.author.username }
@@ -316,6 +451,20 @@ module.exports = class DiscordMcpBridge {
       })),
       referenced_message: referenced,
     };
+
+    // v0.6.0: optionally add a human-readable rendering of the content
+    // (mentions/channels/roles/custom-emoji resolved). Additive only —
+    // never replaces `content`.
+    if (opts && opts.humanize) {
+      const ch = this.stores.channel?.getChannel?.(m.channel_id);
+      const guildId = opts.guildId ?? ch?.guild_id ?? null;
+      out.content_human = this._humanizeContent(m.content, {
+        channelId: m.channel_id,
+        guildId,
+      });
+    }
+
+    return out;
   }
 
   _sleep(ms) {
@@ -354,6 +503,11 @@ module.exports = class DiscordMcpBridge {
             typeof s.threads?.getThreadsForParent === "function",
           pinsStore: !!s.pins,
           fetchPins: typeof this.actions.pins?.fetchPins === "function",
+          roleStore: !!this.stores.role,
+          emojiStore: !!this.stores.emoji,
+          presenceStore: !!this.stores.presence,
+          reactionsStore: !!this.stores.reactions,
+          fetchReactions: !!this.actions.reactions,
         };
       },
 
@@ -375,16 +529,43 @@ module.exports = class DiscordMcpBridge {
           }));
       },
 
-      getMembers: ({ guildId }) => {
+      getMembers: ({ guildId, includeRoleNames }) => {
         const members = this.stores.member.getMembers(guildId) || [];
-        return members.map((m) => ({
-          id: m.userId,
-          nick: m.nick || null,
-          roles: m.roles || [],
-        }));
+        // Optional role-id → role-name map, built once when requested.
+        let roleMap = null;
+        if (includeRoleNames === true) {
+          const roles = this._getGuildRoles(guildId);
+          if (roles && Object.keys(roles).length) {
+            roleMap = {};
+            for (const r of Object.values(roles)) {
+              if (r && r.id) roleMap[r.id] = r.name ?? null;
+            }
+          }
+        }
+        return members.map((m) => {
+          const out = {
+            id: m.userId,
+            username: this.stores.user?.getUser?.(m.userId)?.username ?? null,
+            nick: m.nick || null,
+            roles: m.roles || [],
+          };
+          if (includeRoleNames === true) {
+            out.role_names = (m.roles || []).map((rid) =>
+              roleMap ? roleMap[rid] ?? null : null
+            );
+          }
+          return out;
+        });
       },
 
-      fetchMessages: async ({ channelId, limit, before, authorId, after }) => {
+      fetchMessages: async ({
+        channelId,
+        limit,
+        before,
+        authorId,
+        after,
+        humanize,
+      }) => {
         // Start from whatever is already in the store.
         let cached = this.stores.message.getMessages(channelId);
         let arr = cached?.toArray ? cached.toArray() : [];
@@ -430,10 +611,11 @@ module.exports = class DiscordMcpBridge {
         }
         // Discord keeps messages oldest-first — take the last `limit`
         // and return them newest-first.
+        const fmtOpts = humanize ? { humanize: true } : undefined;
         return msgs
           .slice(-limit)
           .reverse()
-          .map((m) => this._fmtMessage(m));
+          .map((m) => this._fmtMessage(m, fmtOpts));
       },
 
       searchMessages: async ({ guildId, query, limit }) => {
@@ -837,11 +1019,386 @@ module.exports = class DiscordMcpBridge {
         };
       },
 
+      getRoles: ({ guildId }) => {
+        const roles = this._getGuildRoles(guildId);
+        return Object.values(roles)
+          .filter((r) => r && r.id)
+          .map((r) => ({
+            id: r.id,
+            name: r.name ?? null,
+            color: r.color ?? 0,
+            position: r.position ?? 0,
+            // permissions is a BigInt — stringify to preserve precision.
+            permissions: String(r.permissions ?? 0n),
+          }));
+      },
+
+      getGuildInfo: ({ guildId }) => {
+        const g = this.stores.guild?.getGuild?.(guildId);
+        if (!g) throw new Error(`Guild ${guildId} not found`);
+
+        let creationMs = null;
+        try {
+          creationMs = Number((BigInt(g.id) >> 22n) + 1420070400000n);
+        } catch {
+          creationMs = null;
+        }
+
+        // Count channels/categories from the mutable guild-channel map.
+        let channelsCount = 0;
+        let categoriesCount = 0;
+        try {
+          const all = this._guildChannelMap(guildId);
+          for (const c of Object.values(all)) {
+            if (!c || c.guild_id !== guildId) continue;
+            if (c.type === 4) categoriesCount++;
+            else if (c.type === 0 || c.type === 5) channelsCount++;
+          }
+        } catch {
+          /* leave counts at zero on failure */
+        }
+
+        let presenceCount = null;
+        try {
+          if (typeof this.stores.presence?.getGuildPresenceCount === "function") {
+            presenceCount =
+              this.stores.presence.getGuildPresenceCount(guildId) ?? null;
+          }
+        } catch {
+          presenceCount = null;
+        }
+
+        return {
+          id: g.id,
+          name: g.name ?? null,
+          owner_id: g.ownerId ?? g.owner_id ?? null,
+          member_count: g.memberCount ?? g.member_count ?? null,
+          presence_count: presenceCount,
+          creation_date_ms: creationMs,
+          features: g.features ? Array.from(g.features) : [],
+          premium_tier: g.premiumTier ?? g.premium_tier ?? 0,
+          premium_subscription_count:
+            g.premiumSubscriberCount ??
+            g.premium_subscription_count ??
+            null,
+          roles_count: Object.keys(this._getGuildRoles(guildId)).length,
+          channels_count: channelsCount,
+          categories_count: categoriesCount,
+          icon: g.icon ?? null,
+        };
+      },
+
+      resolveId: ({ id }) => {
+        if (!id) throw new Error("resolveId requires an 'id'");
+        // Try guild → user → channel. Never throw for unknown; put a hint in
+        // `error`. Message IDs can't be classified without a channelId.
+        try {
+          const g = this.stores.guild?.getGuild?.(id);
+          if (g) {
+            return {
+              type: "guild",
+              id,
+              brief: g.name ?? null,
+              details: {
+                id: g.id,
+                name: g.name ?? null,
+                owner_id: g.ownerId ?? g.owner_id ?? null,
+              },
+              error: null,
+            };
+          }
+        } catch {
+          /* fall through */
+        }
+        try {
+          const u = this.stores.user?.getUser?.(id);
+          if (u) {
+            return {
+              type: "user",
+              id,
+              brief: u.username ?? null,
+              details: {
+                id: u.id,
+                username: u.username ?? null,
+                global_name: u.globalName ?? u.global_name ?? null,
+                bot: !!u.bot,
+              },
+              error: null,
+            };
+          }
+        } catch {
+          /* fall through */
+        }
+        try {
+          const ch = this.stores.channel?.getChannel?.(id);
+          if (ch) {
+            return {
+              type: ch.type === 11 ? "thread" : "channel",
+              id,
+              brief: ch.name ?? null,
+              details: {
+                id: ch.id,
+                name: ch.name ?? null,
+                type: ch.type,
+                guild_id: ch.guild_id ?? null,
+                parent_id: ch.parent_id ?? null,
+              },
+              error: null,
+            };
+          }
+        } catch {
+          /* fall through */
+        }
+        return {
+          type: "unknown",
+          id,
+          brief: null,
+          details: null,
+          error:
+            "Not a guild, user, or cached channel. If this is a message id, " +
+            "use get_messages with its channelId (message ids can't be " +
+            "resolved on their own).",
+        };
+      },
+
+      getReactions: async ({ channelId, messageId, emoji }) => {
+        if (!channelId || !messageId || !emoji) {
+          throw new Error(
+            "getReactions requires 'channelId', 'messageId' and 'emoji'"
+          );
+        }
+        const store = this.stores.reactions;
+        if (!store || typeof store.getReactions !== "function") {
+          throw new Error("Reactions store not found in this Discord version");
+        }
+
+        // `emoji` may be a unicode char (👍) or a custom-emoji snowflake id.
+        const isCustom = /^\d+$/.test(String(emoji));
+        // ReactionsStore.getReactions(channelId, messageId, emojiObj) requires
+        // an emoji object {name, id}; a 2-arg call throws. For custom emoji the
+        // id matters; for unicode the name is the char itself.
+        const emojiObj = isCustom
+          ? { name: null, id: String(emoji) }
+          : { name: String(emoji), id: null };
+
+        // Store returns a Map (iterated as [userId, userObj] entries) or a
+        // plain object. Normalize to a list of { id, username }.
+        const read = () => {
+          let raw = null;
+          try {
+            raw = store.getReactions(channelId, messageId, emojiObj);
+          } catch {
+            raw = null;
+          }
+          if (!raw) return [];
+          let entries;
+          if (raw instanceof Map) entries = [...raw.entries()];
+          else if (Array.isArray(raw)) entries = raw;
+          else entries = Object.entries(raw);
+
+          const users = [];
+          const seen = new Set();
+          for (const entry of entries) {
+            // entry is [uid, userObj], or a bare userObj/uid.
+            let uid = null;
+            let userObj = null;
+            if (Array.isArray(entry)) {
+              uid = entry[0];
+              userObj = entry[1];
+            } else if (typeof entry === "string") {
+              uid = entry;
+            } else if (entry && typeof entry === "object") {
+              uid = entry.id ?? entry.userId ?? null;
+              userObj = entry;
+            }
+            if (!uid || seen.has(uid)) continue;
+            seen.add(uid);
+            users.push({
+              id: String(uid),
+              username:
+                userObj?.username ??
+                this.stores.user?.getUser?.(uid)?.username ??
+                null,
+            });
+          }
+          return users;
+        };
+
+        let users = read();
+        if (users.length) return users;
+
+        // Not cached — Discord loads reactors lazily (on UI hover). This build
+        // exposes no fetchReactions action, so fall back to the client's
+        // internal REST module. The auth token stays inside the client; it is
+        // never sent to the Python side.
+        const http = this.actions.http;
+        if (http && typeof http.get === "function") {
+          // Build the emoji path segment: "name:id" for custom, encoded char
+          // for unicode.
+          const emojiParam = isCustom
+            ? `name:${emoji}` // caller passed an id but Discord wants name:id;
+            : encodeURIComponent(String(emoji));
+          const path =
+            `/channels/${channelId}/messages/${messageId}` +
+            `/reactions/${emojiParam}?limit=100`;
+          try {
+            const res = await http.get({ url: path });
+            const body = res?.body;
+            if (Array.isArray(body)) {
+              return body
+                .filter((u) => u && u.id)
+                .map((u) => ({
+                  id: String(u.id),
+                  username: u.username ?? null,
+                }));
+            }
+          } catch {
+            // REST failed (bad emoji param, rate-limit, etc.) — return what we
+            // have rather than throwing.
+          }
+        }
+        return users;
+      },
+
+      getThreadsPaginated: async ({
+        channelId,
+        guildId,
+        offset,
+        limit,
+      } = {}) => {
+        const off = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
+        const lim = Math.min(
+          Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 50,
+          250
+        );
+
+        const ts = this.stores.threads;
+        if (!ts) {
+          throw new Error("Threads store not found in this Discord version");
+        }
+
+        // Read active threads the store already holds, normalized to an array.
+        const readActive = () => {
+          if (channelId && typeof ts.getThreadsForParent === "function") {
+            const res =
+              ts.getThreadsForParent(channelId) ||
+              ts.getAllThreadsForParent?.(channelId) ||
+              {};
+            return Array.isArray(res) ? res : Object.values(res);
+          }
+          if (guildId && typeof ts.getThreadsForGuild === "function") {
+            const res = ts.getThreadsForGuild(guildId) || {};
+            return Object.values(res)
+              .map((v) => (v && typeof v === "object" ? Object.values(v) : v))
+              .flat();
+          }
+          return null;
+        };
+
+        let threads = readActive();
+
+        // Archived/forum posts: capture LOAD_ARCHIVED_THREADS_SUCCESS.
+        let firstMessages = null;
+        if (
+          channelId &&
+          (threads === null || threads.length === 0) &&
+          this.dispatcher &&
+          this.actions.loadThreads &&
+          typeof this.actions.loadThreads.loadArchivedThreads === "function"
+        ) {
+          const ch = this.stores.channel?.getChannel?.(channelId);
+          const gid = guildId || ch?.guild_id;
+          const disp = this.dispatcher;
+          let captured = null;
+          const onSuccess = (payload) => {
+            if (!payload || payload.channelId !== channelId) return;
+            captured = payload;
+          };
+          disp.subscribe("LOAD_ARCHIVED_THREADS_SUCCESS", onSuccess);
+          try {
+            try {
+              this.actions.loadThreads.loadArchivedThreads({
+                guildId: gid,
+                channelId,
+                sortOrder: 0,
+                tagFilter: new Set(),
+                tagSetting: "match_some",
+                offset: 0,
+              });
+            } catch {
+              // Ignore synchronous throws; we poll for the dispatch below.
+            }
+            const deadline = Date.now() + 12000;
+            while (Date.now() < deadline && !captured) {
+              await this._sleep(300);
+            }
+          } finally {
+            disp.unsubscribe("LOAD_ARCHIVED_THREADS_SUCCESS", onSuccess);
+          }
+          if (captured && Array.isArray(captured.threads)) {
+            threads = captured.threads;
+            const fm = captured.firstMessages;
+            if (Array.isArray(fm)) {
+              firstMessages = {};
+              for (const m of fm) {
+                if (m && m.channel_id) firstMessages[m.channel_id] = m;
+              }
+            }
+          }
+        }
+
+        if (threads === null) {
+          throw new Error(
+            "No compatible thread getter found; pass guildId or channelId"
+          );
+        }
+
+        // Narrow to a specific parent channel BEFORE paginating.
+        if (channelId) {
+          threads = threads.filter(
+            (t) => t.parent_id === channelId || t.parentId === channelId
+          );
+        }
+
+        const capturedTotal = threads.length;
+        const sliced = threads.slice(off, off + lim);
+        const mapped = sliced.map((t) => {
+          const out = {
+            id: t.id,
+            name: t.name,
+            parent_id: t.parent_id ?? t.parentId ?? null,
+            archived: !!(t.threadMetadata?.archived ?? t.archived),
+            message_count: t.messageCount ?? t.message_count ?? null,
+          };
+          const first = firstMessages?.[t.id];
+          if (first) {
+            out.first_message = {
+              author:
+                first.author?.global_name ||
+                first.author?.username ||
+                first.author?.id ||
+                null,
+              content: (first.content || "").slice(0, 500),
+              timestamp: first.timestamp ?? null,
+              attachments: (first.attachments || []).map((a) => a.url),
+            };
+          }
+          return out;
+        });
+
+        return {
+          threads: mapped,
+          hasMore: sliced.length === lim && off + lim < capturedTotal,
+          // Discord gives no canonical total; expose the captured count.
+          total: capturedTotal,
+        };
+      },
+
       ping: () => {
         // Lightweight health check that always returns.
         const s = this.stores;
         return {
-          version: "0.5.1",
+          version: "0.6.0",
           modules: {
             guildStore: !!s.guild,
             channelStore: !!s.channel,
@@ -862,6 +1419,14 @@ module.exports = class DiscordMcpBridge {
               "function",
             pinsStore: !!s.pins,
             fetchPins: typeof this.actions.pins?.fetchPins === "function",
+            roleStore: !!this.stores.role,
+            emojiStore: !!this.stores.emoji,
+            presenceStore: !!this.stores.presence,
+            reactionsStore: !!this.stores.reactions,
+            fetchReactions: !!this.actions.reactions,
+            // Internal REST client — powers the get_reactions fallback when
+            // reactors aren't cached. Auth token stays in the client.
+            httpClient: typeof this.actions.http?.get === "function",
           },
         };
       },

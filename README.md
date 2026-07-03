@@ -99,17 +99,26 @@ already-authenticated client.
 | `diagnostics` | Show which internal Discord modules resolved (debugging) |
 | `list_guilds` | List servers the client can see |
 | `list_channels` | List a server's text channels |
-| `get_messages` | Read a channel's history (paginate with `before`; filter by `author_id` / `after`) |
+| `get_messages` | Read a channel's history (paginate with `before`; filter by `author_id` / `after`; `humanize` resolves mentions) |
 | `search_messages` | Native Discord search across a server |
+| `search_local` | Offline full-text search (SQLite FTS5) over `exports/*.json` |
 | `get_message_by_link` | Fetch a single message from a Discord message link |
+| `get_reactions` | List users who reacted to a message with a given emoji |
 | `list_dms` | List the account's direct and group DMs |
 | `list_threads` | List threads or forum posts (loads uncached forum posts; includes `first_message`) |
+| `list_threads_paginated` | Paginated threads/forum posts (`offset`/`limit`, returns `{threads, hasMore, total}`) |
 | `read_thread` | Read a thread / forum post's messages in chronological order |
 | `get_pins` | List a channel's or thread's pinned messages |
 | `get_channel_info` | Metadata for a channel or thread |
-| `list_members` | Members currently known to the client |
+| `get_guild_info` | Guild metadata: roles, channels, member count, features, boost tier |
+| `resolve_id` | Classify any snowflake as guild/channel/thread/user/message |
+| `list_members` | Members currently known to the client (`resolve_role_names` adds role names) |
+| `get_roles` | List a guild's roles (id, name, color, position, permissions) |
 | `get_user_info` | Look up a user by id |
 | `export_channel` | Dump a channel's history to `exports/*.json` |
+| `export_attachments` | Download a channel's attachments to `exports/` with a manifest |
+| `download_attachment` | Download a single Discord CDN attachment to `exports/` |
+| `channel_stats` | Offline analytics from a channel export (per-user, timeline, reply graph) |
 
 ## Typical flow
 

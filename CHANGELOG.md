@@ -10,6 +10,42 @@ The plugin (`@version` in `DiscordMcpBridge.plugin.js`) and the Python package
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-03
+
+### Added
+- `get_roles` — list a guild's roles (id, name, color, position, permissions),
+  handy for decoding the role IDs returned by `list_members`.
+- `get_guild_info` — guild metadata: name, description, creation date, member
+  count, roles, channels/categories, features, boost (premium) tier, owner.
+- `resolve_id` — classify any snowflake as guild/channel/thread/user/message
+  and return brief info plus its creation time.
+- `get_reactions` — list the users who reacted to a message with a given emoji
+  (unicode char or custom-emoji snowflake).
+- `list_threads_paginated` — offset/limit pagination over forum posts/threads,
+  returning `{threads, hasMore, total}` (`hasMore`/`total` are heuristics).
+  `list_threads` is unchanged and still returns a flat list.
+- `download_attachment` — download a single Discord CDN attachment
+  (cdn.discordapp.com / media.discordapp.net only) into `exports/`.
+- `export_attachments` — walk a channel's history, download all attachments
+  concurrently, and write an `attachments_<channel_id>.json` manifest.
+- `search_local` — offline full-text search (SQLite FTS5) over `exports/*.json`
+  produced by `export_channel`; the index rebuilds incrementally by file mtime.
+  New module `discord_mcp/local_index.py`.
+- `channel_stats` — offline analytics from a channel export: per-user counts,
+  top authors, reply/mention graph, active hours/days, time distribution, and a
+  summary. New module `discord_mcp/analytics.py`.
+
+### Changed
+- `list_members` gained `resolve_role_names` (default False); when True each
+  member also carries `role_names`. Existing fields (`id`, `username`, `nick`,
+  `roles`) are unchanged.
+- `get_messages` gained a `humanize` flag (default False); when True each
+  message also carries `content_human` with mentions (`<#chan>`, `<@user>`,
+  `<@&role>`, `<:emoji:id>`) resolved. The original `content` is untouched.
+
+### Dependencies
+- Added `httpx>=0.24.0` (used by the attachment-download tools).
+
 ## [0.5.1] - 2026-07-03
 
 ### Fixed
