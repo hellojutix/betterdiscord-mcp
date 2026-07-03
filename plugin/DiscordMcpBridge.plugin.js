@@ -4,7 +4,7 @@
  * @description Bridge between the Discord client and a Python MCP server.
  *   Reads data from the authenticated client and exposes it to an AI agent.
  *   Self-bot tool — violates Discord ToS. Use at your own risk.
- * @version 0.5.0
+ * @version 0.5.1
  * @source https://github.com/encryrose/betterdiscord-mcp
  */
 
@@ -184,6 +184,82 @@ module.exports = class DiscordMcpBridge {
   }
 
   // --- Formatting helpers ---
+
+  // Human-readable text for Discord system messages (joins, boosts, pins,
+  // etc.). These carry an empty `content`; the client renders text from the
+  // message `type`. Returns null for normal messages (type 0 / 19).
+  _systemText(m) {
+    const t = m.type;
+    if (t === 0 || t === 19 || t == null) return null; // DEFAULT / REPLY
+    const who = m.author?.username ?? "Someone";
+    switch (t) {
+      case 1:
+        return `${who} added someone to the group.`;
+      case 2:
+        return `${who} removed someone / left the group.`;
+      case 3:
+        return `${who} started a call.`;
+      case 4:
+        return `${who} changed the channel name: ${m.content || ""}`.trim();
+      case 5:
+        return `${who} changed the channel icon.`;
+      case 6:
+        return `${who} pinned a message to this channel.`;
+      case 7:
+        // USER_JOIN: the client picks one of these deterministically from the
+        // message creation timestamp. Reproduce the same selection.
+        return this._joinMessage(m, who);
+      case 8:
+        return `${who} just boosted the server!`;
+      case 9:
+      case 10:
+      case 11: {
+        const tier = t - 8; // 9->1, 10->2, 11->3
+        return `${who} just boosted the server! The server has achieved Level ${tier}!`;
+      }
+      case 12:
+        return `${who} has added this channel to their feed.`;
+      case 18:
+        return `${who} started a thread: ${m.content || ""}`.trim();
+      case 21:
+        return `${who} started a thread.`;
+      case 46:
+        return `Poll: ${m.content || ""}`.trim();
+      default:
+        return `[system message type ${t}]${m.content ? " " + m.content : ""}`;
+    }
+  }
+
+  // Reproduce Discord's deterministic USER_JOIN message selection. The client
+  // indexes a fixed list by (snowflake creation ms % list length).
+  _joinMessage(m, who) {
+    const templates = [
+      "%user% joined the party.",
+      "%user% is here.",
+      "Welcome, %user%. We hope you brought pizza.",
+      "A wild %user% appeared.",
+      "%user% just landed.",
+      "%user% just slid into the server.",
+      "%user% just showed up!",
+      "Welcome %user%. Say hi!",
+      "%user% hopped into the server.",
+      "Everyone welcome %user%!",
+      "Glad you're here, %user%.",
+      "Good to see you, %user%.",
+      "Yay you made it, %user%!",
+    ];
+    let idx = 0;
+    try {
+      // Discord snowflake: creation ms = (id >> 22) + epoch. The client uses
+      // the creation timestamp in ms modulo the template count.
+      const created = (BigInt(m.id) >> 22n) + 1420070400000n;
+      idx = Number(created % BigInt(templates.length));
+    } catch {
+      idx = 0;
+    }
+    return templates[idx].replace("%user%", who);
+  }
+
   _fmtMessage(m) {
     // Summarize a reply reference when the message is a reply.
     let referenced = null;
@@ -204,12 +280,18 @@ module.exports = class DiscordMcpBridge {
       };
     }
 
+    const systemText = this._systemText(m);
+
     return {
       id: m.id,
       author: m.author
         ? { id: m.author.id, username: m.author.username }
         : null,
       content: m.content,
+      // Message type (0 = normal, 19 = reply; anything else is a system
+      // message such as a join or boost) plus its rendered text.
+      type: m.type ?? null,
+      system_text: systemText,
       timestamp: m.timestamp?.toString?.() ?? m.timestamp,
       edited_timestamp:
         m.editedTimestamp?.toString?.() ??
@@ -759,7 +841,7 @@ module.exports = class DiscordMcpBridge {
         // Lightweight health check that always returns.
         const s = this.stores;
         return {
-          version: "0.5.0",
+          version: "0.5.1",
           modules: {
             guildStore: !!s.guild,
             channelStore: !!s.channel,

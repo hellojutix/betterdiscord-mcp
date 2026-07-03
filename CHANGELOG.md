@@ -10,6 +10,18 @@ The plugin (`@version` in `DiscordMcpBridge.plugin.js`) and the Python package
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-03
+
+### Fixed
+- System messages (member joins, server boosts, pins, thread-created, etc.)
+  are no longer reported as empty. Discord stores these with an empty
+  `content` and renders their text on the client from the message `type`, so
+  a channel full of joins/boosts previously looked empty. Each formatted
+  message now carries its numeric `type` plus a human-readable `system_text`.
+  For `USER_JOIN` (type 7) the plugin reproduces Discord's deterministic
+  template selection from the message snowflake (English wording; the client
+  may show a localized variant).
+
 ## [0.5.0] - 2026-07-03
 
 ### Added
