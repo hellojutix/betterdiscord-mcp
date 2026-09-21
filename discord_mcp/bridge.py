@@ -37,9 +37,16 @@ class Bridge:
 
     async def start(self) -> None:
         """Запустить WS-сервер (не блокирует — работает в фоне)."""
-        self._server = await websockets.serve(
-            self._handle_conn, self._host, self._port
-        )
+        for i in range(40):
+            try:
+                self._server = await websockets.serve(
+                    self._handle_conn, self._host, self._port
+                )
+                break
+            except OSError:
+                if i == 39:
+                    raise
+                await asyncio.sleep(1)
 
     async def stop(self) -> None:
         if self._server is not None:

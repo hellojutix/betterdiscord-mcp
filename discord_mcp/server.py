@@ -21,6 +21,18 @@ from .bridge import Bridge
 from .local_index import LocalIndex
 
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8787"))
+# Guild that write/admin operations are restricted to. Must be set to enable
+# manage_guild / admin_diagnostics / list_all_channels.
+MANAGED_GUILD_ID = os.environ.get("MANAGED_GUILD_ID", "").strip()
+
+
+def _managed_guild() -> str:
+    if not re.fullmatch(r"\d{17,20}", MANAGED_GUILD_ID):
+        raise ValueError(
+            "MANAGED_GUILD_ID is not configured; set it in your environment "
+            "to enable guild management tools"
+        )
+    return MANAGED_GUILD_ID
 EXPORT_DIR = pathlib.Path(__file__).resolve().parent.parent / "exports"
 
 _bridge = Bridge(port=BRIDGE_PORT)
@@ -630,6 +642,80 @@ async def channel_stats(
 
     messages = json.loads(path.read_text(encoding="utf-8"))
     return await asyncio.to_thread(analytics.compute_stats, messages)
+
+
+@mcp.tool()
+async def manage_guild(
+    guild_id: str, operation: str, fields: dict, target_id: str | None = None
+) -> dict:
+    """Manage the configured guild without confirmation dialogs. Execute sequentially.
+
+    Operations: create_channel, update_channel, delete_channel; create_role,
+    update_role, delete_role; update_guild; add_member_role, remove_member_role
+    (target_id=user id, fields={role_id: id}); timeout_member (target_id=user id,
+    fields={communication_disabled_until: ISO timestamp or null}, max 28 days);
+    kick_member, ban_member, unban_member (target_id=user id, fields={});
+    list_invites (fields={}); create_invite (target_id=channel id,
+    fields may contain max_age, max_uses, temporary, unique);
+    delete_invite (target_id=invite code, fields={}); reorder_roles
+    (fields={roles: [{id, position}]} to set role hierarchy).
+    Channel/role updates and deletions require target_id. fields uses Discord
+    API field names; permissions are decimal strings. Ban preserves messages.
+    Only the guild set in MANAGED_GUILD_ID is allowed. No message operations.
+    Channel deletion destroys its history; use only on explicit user request.
+    On timeout, inspect current state before retrying: a write may have applied.
+    """
+    managed = _managed_guild()
+    if guild_id != managed and operation not in {"list_emojis", "list_stickers"}:
+        raise ValueError("Writes restricted to Exol")
+    allowed = {
+        "create_channel", "update_channel", "create_role", "update_role",
+        "update_guild", "delete_channel", "delete_role", "add_member_role",
+        "remove_member_role", "timeout_member", "kick_member", "ban_member",
+        "unban_member", "list_invites", "create_invite", "delete_invite",
+        "reorder_roles", "create_webhook", "create_emoji", "list_emojis", "delete_emoji",
+        "create_sticker", "list_stickers", "delete_sticker",
+    }
+    if operation not in allowed:
+        raise ValueError("Unsupported operation")
+    if operation in {"create_channel", "create_role", "update_channel",
+                     "update_role", "update_guild", "create_webhook", "create_emoji", "create_sticker"} and not fields:
+        raise ValueError("fields must not be empty")
+    if operation == "reorder_roles":
+        if not isinstance(fields.get("roles"), list) or not fields["roles"]:
+            raise ValueError("fields.roles must be a non-empty list")
+    elif operation == "delete_invite":
+        if not target_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", target_id):
+            raise ValueError("Valid invite code required")
+    elif operation not in {"create_channel", "create_role", "update_guild",
+                           "list_invites", "create_emoji", "list_emojis", "create_sticker", "list_stickers"}:
+        if not target_id or not re.fullmatch(r"\d{17,20}", target_id):
+            raise ValueError("Valid target_id required")
+    return await _bridge.call(
+        "manageGuild",
+        {"guildId": guild_id, "operation": operation,
+         "targetId": target_id, "fields": fields},
+        timeout=90.0,
+    )
+
+
+@mcp.tool()
+async def admin_diagnostics() -> dict:
+    """Read-only diagnostics for the managed guild: account, ownership,
+    channels and HTTP shape.
+
+    Does not expose tokens, authorization headers or message content.
+    """
+    _managed_guild()
+    return await _bridge.call("adminDiagnostics", {"guildId": _managed_guild()}, timeout=30.0)
+
+
+@mcp.tool()
+async def list_all_channels() -> list[dict]:
+    """Full channel tree for the managed guild via REST: all types incl.
+    categories, voice, forums, with parent_id and position. Use to verify
+    structure."""
+    return await _bridge.call("listAllChannels", {"guildId": _managed_guild()}, timeout=30.0)
 
 
 def main() -> None:

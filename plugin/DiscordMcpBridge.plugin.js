@@ -18,8 +18,9 @@ module.exports = class DiscordMcpBridge {
     this.reconnectDelay = 3000; // current backoff delay (ms), grows on failure
     this.stores = {};
     this.actions = {};
-    // Port is loaded from persisted settings on start (fallback to default).
+    // Port and managed guild are loaded from persisted settings on start.
     this.port = DEFAULT_BRIDGE_PORT;
+    this.managedGuildId = null;
   }
 
   start() {
@@ -27,6 +28,10 @@ module.exports = class DiscordMcpBridge {
     const saved = BdApi.Data.load(PLUGIN_NAME, "port");
     const parsed = parseInt(saved, 10);
     this.port = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_BRIDGE_PORT;
+    // Guild that write/admin operations are restricted to. Set via
+    // BdApi.Data.save("DiscordMcpBridge", "managedGuildId", "<guild id>").
+    const g = BdApi.Data.load(PLUGIN_NAME, "managedGuildId");
+    this.managedGuildId = /^\d{17,20}$/.test(String(g || "")) ? String(g) : null;
     this._resolveModules();
     this._connect();
     BdApi.UI.showToast("DiscordMcpBridge started", { type: "info" });
@@ -157,23 +162,62 @@ module.exports = class DiscordMcpBridge {
     this.actions.reactions =
       Webpack.getModule((m) => m && typeof m.fetchReactions === "function") ||
       null;
-    // Discord's internal REST client (get/post/put/patch/del). Used as an
-    // awaitable fallback for data the stores don't cache (e.g. reactors). The
-    // auth token lives inside this module and never leaves the client.
-    this.actions.http =
+    this.actions.admin =
       Webpack.getModule(
-        (m) =>
-          m &&
-          typeof m.get === "function" &&
-          typeof m.post === "function" &&
-          typeof m.patch === "function" &&
-          typeof m.put === "function"
-      ) ||
+        m => m && typeof m === "object" && typeof m.createRole === "function" && typeof m.kickUser === "function",
+        { searchExports: true }
+      ) || null;
+    this.actions.guildSettings =
       Webpack.getModule(
-        (m) => m && m.default && typeof m.default.get === "function" &&
-          typeof m.default.post === "function"
-      )?.default ||
-      null;
+        m => m && typeof m === "object" && typeof m.updateGuild === "function" && typeof m.saveGuild === "function",
+        { searchExports: true }
+      ) || null;
+    this.actions.channelCreator =
+      Webpack.getModule(
+        m => m && typeof m === "object" && typeof m.createChannel === "function" && typeof m.createRoleSubscriptionTemplateChannel === "function",
+        { searchExports: true }
+      ) || null;
+    this.actions.channelEditor =
+      Webpack.getModule(
+        m => m && typeof m === "object" && typeof m.updateChannel === "function" && typeof m.saveChannel === "function" && typeof m.deleteChannel === "function",
+        { searchExports: true }
+      ) || null;
+    // Discord's real internal REST client is resolved lazily and verified
+    // against /users/@me (see _resolveHttp). The auth token stays inside the
+    // client and never leaves it.
+    this.actions.http = null;
+    this.actions.httpDel = null;
+  }
+
+  // Find Discord's authenticated REST client by probing /users/@me. Superagent
+  // and other lookalikes also expose get/post/patch/put, so signature checks
+  // are unreliable; only a live call that returns the current user is trusted.
+  async _resolveHttp() {
+    if (this.actions.http && typeof this.actions.httpDel === "function") {
+      return this.actions.http;
+    }
+    const cands = BdApi.Webpack.getModules?.(
+      m => m && typeof m === "object" &&
+        ["get", "post", "patch", "put"].every(k => typeof m[k] === "function") &&
+        (typeof m.del === "function" || typeof m.delete === "function"),
+      { searchExports: true }
+    ) || [];
+    for (const c of cands) {
+      try {
+        const r = await Promise.race([
+          c.get({ url: "/users/@me" }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("probe timeout")), 6000)),
+        ]);
+        if (r?.body?.id && r?.body?.username) {
+          this.actions.http = c;
+          this.actions.httpDel = c.del || c.delete;
+          return c;
+        }
+      } catch {
+        /* not the authenticated client; try the next candidate */
+      }
+    }
+    return null;
   }
 
   // --- Role lookup helper (v0.6.0) ---
@@ -308,14 +352,242 @@ module.exports = class DiscordMcpBridge {
       const result = await this._dispatch(req.method, req.params || {});
       reply({ ok: true, result });
     } catch (e) {
-      reply({ ok: false, error: String(e?.message || e) });
+      const errStr = e?.message || (typeof e === "object" ? JSON.stringify(e) : String(e));
+      reply({ ok: false, error: errStr });
     }
   }
 
   _dispatch(method, params) {
-    const fn = this._handlers()[method];
+    if (method === "adminDiagnostics") {
+      return this._adminDiagnostics();
+    }
+    if (method === "listAllChannels") {
+      return this._listAllChannels(params);
+    }
+    if (method === "manageGuild") return this._manageGuild(params);
+    const handlers = this._handlers();
+    const fn = Object.hasOwn(handlers, method) ? handlers[method] : null;
     if (!fn) throw new Error(`Unknown method: ${method}`);
     return fn(params);
+  }
+
+  _managedGuildId() {
+    if (!this.managedGuildId) throw new Error("managedGuildId not configured — set BdApi.Data.save(\"DiscordMcpBridge\", \"managedGuildId\", \"<guild id>\")");
+    return this.managedGuildId;
+  }
+
+  // Compact full channel tree (all types) via the verified REST client.
+  async _listAllChannels({ guildId }) {
+    const managed = this._managedGuildId();
+    if (guildId !== managed) throw new Error("Restricted to managed guild");
+    const http = await this._resolveHttp();
+    if (!http) throw new Error("Authenticated Discord HTTP module not verified");
+    const r = await http.get({ url: `/guilds/${guildId}/channels` });
+    if (!Array.isArray(r?.body)) throw new Error(`Unexpected response: ${r?.status}`);
+    return r.body
+      .map(c => ({ id: c.id, name: c.name, type: c.type, parent_id: c.parent_id ?? null, position: c.position ?? 0 }))
+      .sort((a, b) => (a.type === 4 ? -1 : b.type === 4 ? 1 : 0) || a.position - b.position);
+  }
+
+  async _adminDiagnostics() {
+    const guildId = this._managedGuildId();
+    const user = this.stores.user?.getCurrentUser?.();
+    const guild = this.stores.guild?.getGuild?.(guildId);
+    const permissions = BdApi.Webpack.getStore?.("PermissionStore");
+    let manageChannels = null;
+    try { manageChannels = permissions?.can?.(16n, guild) ?? null; } catch {}
+    let response;
+    try {
+      const hc = await this._resolveHttp();
+      if (!hc) throw new Error("authenticated client not resolved");
+      const r = await hc.get({ url: `/guilds/${guildId}/channels` });
+      response = {
+        status: r?.status ?? null,
+        keys: r && typeof r === "object" ? Object.keys(r) : [],
+        bodyType: Array.isArray(r?.body) ? "array" : typeof r?.body,
+        textType: typeof r?.text,
+        contentType: r?.headers?.["content-type"] ?? null,
+        channels: Array.isArray(r?.body) ? r.body.map(c => ({id:c.id, name:c.name, type:c.type, parent_id:c.parent_id ?? null})) : null,
+        errorCode: r?.body?.code ?? null,
+        errorMessage: r?.body?.message ?? null,
+      };
+    } catch (e) {
+      response = { status: e?.status ?? null, code: e?.body?.code ?? null, message: e?.body?.message ?? "HTTP read failed" };
+    }
+    return {
+      diagnosticVersion: 2,
+      authenticatedHttpResolved: !!(this.actions.http && typeof this.actions.http.del === "function"),
+      httpCandidates: (BdApi.Webpack.getModules?.(m => m && ["get", "post", "patch", "put"].every(k => typeof m[k] === "function"), { searchExports: true }) || []).map(m => ({
+        keys: Object.keys(m).filter(k => typeof m[k] === "function").slice(0, 12),
+        getArity: m.get.length,
+        hasApiBase: typeof m.getAPIBaseURL === "function",
+        apiBase: (() => { try { return typeof m.getAPIBaseURL === "function" ? m.getAPIBaseURL() : null; } catch { return null; } })(),
+      })).slice(0, 15),
+      createStickerInfo: (() => {
+        const m = BdApi.Webpack.getModule(m => m && (m.CREATE_STICKER || m.createSticker), { searchExports: true });
+        return m ? { keys: Object.keys(m), values: Object.fromEntries(Object.entries(m).map(([k, v]) => [k, typeof v === "function" ? String(v).slice(0, 300) : v])) } : null;
+      })(),
+      adminCandidates: (BdApi.Webpack.getModules?.(m => m && typeof m === "object" && ["createChannel", "createRole", "updateGuild", "createGuildChannel", "createGuildRole"].some(k => typeof m[k] === "function"), { searchExports: true }) || []).map(m => ({
+        keys: Object.keys(m).filter(k => typeof m[k] === "function").slice(0, 20),
+      })).slice(0, 15),
+      httpProbe: await (async () => {
+        const cands = BdApi.Webpack.getModules?.(m => m && typeof m === "object" && typeof m.get === "function" && typeof m.post === "function" && typeof m.patch === "function" && typeof m.put === "function" && typeof m.del === "function", { searchExports: true }) || [];
+        const out = [];
+        for (let i = 0; i < Math.min(cands.length, 3); i++) {
+          const c = cands[i];
+          try {
+            const r = await Promise.race([c.get({ url: "/users/@me" }), new Promise((_, rej) => setTimeout(() => rej(new Error("probe timeout")), 8000))]);
+            out.push({ i, ct: r?.headers?.["content-type"] ?? null, status: r?.status ?? null, isUser: !!(r?.body?.id && r?.body?.username), username: r?.body?.username ?? null });
+          } catch (e) {
+            out.push({ i, error: String(e?.message || e).slice(0, 120) });
+          }
+        }
+        return out;
+      })(),
+      channelEditorSig: (() => {
+        const ce = this.actions.channelEditor;
+        if (!ce) return null;
+        return {
+          open: ce.open.length, updateChannel: ce.updateChannel.length,
+          saveChannel: ce.saveChannel.length, deleteChannel: ce.deleteChannel.length,
+          updateChannelSrc: String(ce.updateChannel).slice(0, 300),
+          saveChannelSrc: String(ce.saveChannel).slice(0, 1200),
+          openSrc: String(ce.open).slice(0, 200),
+        };
+      })(),
+      channelEditors: (BdApi.Webpack.getModules?.(m => m && typeof m === "object" && typeof m.updateChannel === "function" && typeof m.deleteChannel === "function", { searchExports: true }) || []).map(m => ({
+        keys: Object.keys(m).filter(k => typeof m[k] === "function").slice(0, 20),
+      })).slice(0, 10),
+      currentUserId: user?.id ?? null,
+      isOwner: !!user && user.id === (guild?.ownerId ?? guild?.owner_id),
+      manageChannels,
+      cachedChannels: Object.values(this._guildChannelMap(guildId)).filter(c => c.guild_id === guildId).map(c => ({id:c.id, name:c.name, type:c.type})),
+      response,
+    };
+  }
+
+  // Administrative writes use the client's own action creators; no raw HTTP.
+  async _manageGuild({ guildId, operation, targetId, fields = {} }) {
+    const managed = this._managedGuildId();
+    if (guildId !== managed && !["list_emojis", "list_stickers"].includes(operation)) throw new Error("Writes restricted to managed guild");
+    if (!fields || typeof fields !== "object") throw new Error("Invalid fields");
+    const http = await this._resolveHttp();
+    const del = this.actions.httpDel;
+    if (!http || typeof http.get !== "function" || typeof del !== "function") throw new Error("Authenticated Discord HTTP module not verified; writes disabled");
+    const specs = {
+      create_channel: ["post", `/guilds/${guildId}/channels`, ["name", "type", "topic", "parent_id", "permission_overwrites", "rate_limit_per_user"]],
+      update_channel: ["patch", `/channels/${targetId}`, ["name", "topic", "parent_id", "position", "permission_overwrites", "rate_limit_per_user", "user_limit"]],
+      delete_channel: ["del", `/channels/${targetId}`, []],
+      create_role: ["post", `/guilds/${guildId}/roles`, ["name", "permissions", "color", "hoist", "mentionable", "icon", "unicode_emoji"]],
+      update_role: ["patch", `/guilds/${guildId}/roles/${targetId}`, ["name", "permissions", "color", "hoist", "mentionable", "icon", "unicode_emoji"]],
+      delete_role: ["del", `/guilds/${guildId}/roles/${targetId}`, []],
+      add_member_role: ["put", `/guilds/${guildId}/members/${targetId}/roles/${fields.role_id}`, ["role_id"]],
+      remove_member_role: ["del", `/guilds/${guildId}/members/${targetId}/roles/${fields.role_id}`, ["role_id"]],
+      timeout_member: ["patch", `/guilds/${guildId}/members/${targetId}`, ["communication_disabled_until"]],
+      kick_member: ["del", `/guilds/${guildId}/members/${targetId}`, []],
+      ban_member: ["put", `/guilds/${guildId}/bans/${targetId}`, []],
+      unban_member: ["del", `/guilds/${guildId}/bans/${targetId}`, []],
+      list_invites: ["get", `/guilds/${guildId}/invites`, []],
+      create_invite: ["post", `/channels/${targetId}/invites`, ["max_age", "max_uses", "temporary", "unique"]],
+      delete_invite: ["del", `/invites/${targetId}`, []],
+      update_guild: ["patch", `/guilds/${guildId}`, ["name", "description", "verification_level", "default_message_notifications", "explicit_content_filter"]],
+      reorder_roles: ["patch", `/guilds/${guildId}/roles`, ["roles"]],
+      create_webhook: ["post", `/channels/${targetId}/webhooks`, ["name", "avatar"]],
+      create_emoji: ["post", `/guilds/${guildId}/emojis`, ["name", "image", "roles", "file_path"]],
+      list_emojis: ["get", `/guilds/${guildId}/emojis`, []],
+      delete_emoji: ["del", `/guilds/${guildId}/emojis/${targetId}`, []],
+      create_sticker: ["post", `/guilds/${guildId}/stickers`, ["name", "description", "tags", "file", "image", "file_path"]],
+      list_stickers: ["get", `/guilds/${guildId}/stickers`, []],
+      delete_sticker: ["del", `/guilds/${guildId}/stickers/${targetId}`, []],
+    };
+    if (!Object.hasOwn(specs, operation)) throw new Error("Unsupported operation");
+    const [verb, url, allowed] = specs[operation];
+    if (Object.keys(fields).some(k => !allowed.includes(k))) throw new Error("Unsupported fields");
+    if (["create_channel", "update_channel", "create_role", "update_role", "update_guild", "create_emoji", "create_sticker"].includes(operation) && !Object.keys(fields).length) throw new Error("Empty fields");
+    if (operation === "reorder_roles") {
+      if (!Array.isArray(fields.roles) || !fields.roles.length) throw new Error("reorder_roles needs non-empty fields.roles array");
+      const known = this._getGuildRoles(guildId);
+      for (const e of fields.roles) {
+        if (!e || typeof e !== "object") throw new Error("Each role entry must be an object");
+        if (!/^\d{17,20}$/.test(String(e.id || ""))) throw new Error(`Invalid role id: ${e.id}`);
+        if (!known[e.id]) throw new Error(`Role ${e.id} not in Exol cache`);
+        if (e.position != null && !Number.isInteger(e.position)) throw new Error(`Invalid position for role ${e.id}`);
+      }
+    }
+    if (operation === "timeout_member" && !Object.hasOwn(fields, "communication_disabled_until")) throw new Error("communication_disabled_until required");
+    if (!["create_channel", "create_role", "update_guild", "list_invites", "delete_invite", "reorder_roles", "create_emoji", "list_emojis", "create_sticker", "list_stickers"].includes(operation)) {
+      if (!/^\d{17,20}$/.test(targetId || "")) throw new Error("Invalid target id");
+      if (["update_channel", "delete_channel", "create_invite", "create_webhook"].includes(operation) && this.stores.channel?.getChannel?.(targetId)?.guild_id !== guildId) throw new Error("Channel not in Exol cache");
+      if (["update_role", "delete_role"].includes(operation) && !this._getGuildRoles(guildId)[targetId]) throw new Error("Role not in Exol cache");
+      if (["add_member_role", "remove_member_role", "timeout_member", "kick_member"].includes(operation) && !this.stores.member?.getMember?.(guildId, targetId)) throw new Error("Member not in Exol cache");
+    }
+    if (["add_member_role", "remove_member_role"].includes(operation)) {
+      if (!/^\d{17,20}$/.test(fields.role_id || "") || !this._getGuildRoles(guildId)[fields.role_id]) throw new Error("Invalid Exol role_id");
+    }
+    if (operation === "timeout_member") {
+      const until = fields.communication_disabled_until;
+      const ms = typeof until === "string" ? Date.parse(until) : NaN;
+      if (until !== null && (!Number.isFinite(ms) || ms <= Date.now() || ms > Date.now() + 28 * 86400000)) throw new Error("Timeout must be within 28 days or null");
+    }
+    if (operation === "delete_channel") {
+      const ch = this.stores.channel?.getChannel?.(targetId);
+      if (["rules", "announcements", "welcome", "faq", "general"].includes(ch?.name?.toLowerCase())) throw new Error(`Refusing deletion of protected channel ${ch.name}`);
+    }
+    if (operation === "delete_invite") {
+      const invite = await http.get({ url: `/invites/${targetId}` });
+      if (invite?.body?.guild?.id !== guildId) throw new Error("Invite not verified as belonging to Exol");
+    }
+    if (fields.parent_id != null && this.stores.channel?.getChannel?.(fields.parent_id)?.guild_id !== guildId) throw new Error("Parent not in Exol");
+    if (this.adminPending) throw new Error("Another administrative action is running");
+    this.adminPending = true;
+    try {
+      try { BdApi.UI.showToast(`Exol MCP: ${operation}`, { type: "info" }); } catch {}
+      const options = { url };
+      if (verb === "post" || verb === "patch" || verb === "put") {
+        if (operation === "create_sticker") {
+          let rawB64 = (fields.file || fields.image || "").replace(/^data:image\/\w+;base64,/, "").trim();
+          if (fields.file_path) {
+            const fs = require("fs");
+            rawB64 = fs.readFileSync(fields.file_path, "base64").trim();
+          }
+          const byteChars = atob(rawB64);
+          const byteNumbers = new Uint8Array(byteChars.length);
+          for (let i = 0; i < byteChars.length; i++) byteNumbers[i] = byteChars.charCodeAt(i);
+          const blob = new Blob([byteNumbers], { type: "image/png" });
+          const fd = new FormData();
+          fd.append("name", fields.name);
+          fd.append("description", fields.description || "");
+          fd.append("tags", fields.tags || "exol");
+          fd.append("file", blob, "sticker.png");
+          options.body = fd;
+        } else if (operation === "create_emoji") {
+          let img = fields.image;
+          if (fields.file_path) {
+            const fs = require("fs");
+            const buf = fs.readFileSync(fields.file_path);
+            img = `data:image/png;base64,${buf.toString("base64")}`;
+          }
+          options.body = { name: fields.name, image: img, roles: fields.roles || [] };
+        } else if (operation === "reorder_roles") {
+          options.body = fields.roles.map(e => ({ id: e.id, position: e.position }));
+        } else {
+          const body = { ...fields };
+          delete body.role_id;
+          options.body = body;
+        }
+      }
+      const fn = verb === "del" ? del : http[verb];
+      const response = await fn(options);
+      const status = response?.status ?? null;
+      if (!status || status < 200 || status >= 300) {
+        throw new Error(`Discord returned ${status}: ${JSON.stringify(response?.body ?? null).slice(0, 300)}`);
+      }
+      const b = response.body;
+      const slim = b && typeof b === "object" && !Array.isArray(b)
+        ? Object.fromEntries(Object.entries(b).filter(([k]) => ["id", "name", "type", "parent_id", "position", "code", "message", "permissions", "token", "channel_id", "url"].includes(k)))
+        : (Array.isArray(b) ? b.map(x => ({ id: x?.id, name: x?.name, position: x?.position, permissions: x?.permissions != null ? String(x.permissions) : undefined, type: x?.type, parent_id: x?.parent_id ?? null, description: x?.description, tags: x?.tags, animated: x?.animated })) : b);
+      return { operation, guild_id: guildId, status, result: slim ?? null };
+    } finally { this.adminPending = false; }
   }
 
   // --- Formatting helpers ---
@@ -520,7 +792,7 @@ module.exports = class DiscordMcpBridge {
           st.getAllChannels?.() ||
           {};
         return Object.values(all)
-          .filter((c) => c.guild_id === guildId && [0, 5].includes(c.type))
+          .filter((c) => c.guild_id === guildId && [0, 2, 4, 5].includes(c.type))
           .map((c) => ({
             id: c.id,
             name: c.name,
@@ -996,6 +1268,7 @@ module.exports = class DiscordMcpBridge {
           parent_id: c.parent_id ?? null,
           topic: c.topic ?? null,
           nsfw: !!c.nsfw,
+          permission_overwrites: c.permissionOverwrites ?? c.permission_overwrites ?? null,
           // Thread-specific fields when this channel is a thread/forum post.
           owner_id: c.ownerId ?? c.owner_id ?? null,
           message_count: c.messageCount ?? c.message_count ?? null,
@@ -1028,9 +1301,32 @@ module.exports = class DiscordMcpBridge {
             name: r.name ?? null,
             color: r.color ?? 0,
             position: r.position ?? 0,
+            icon: r.icon ?? null,
+            unicode_emoji: r.unicode_emoji ?? r.unicodeEmoji ?? null,
+            hoist: !!r.hoist,
+            mentionable: !!r.mentionable,
             // permissions is a BigInt — stringify to preserve precision.
             permissions: String(r.permissions ?? 0n),
           }));
+      },
+
+      getGuildExpressions: async ({ guildId }) => {
+        const http = await this._resolveHttp();
+        let emojis = [];
+        let stickers = [];
+        try {
+          const r = await http.get({ url: `/guilds/${guildId}/emojis` });
+          emojis = (r?.body || []).map(e => ({ id: e.id, name: e.name, animated: !!e.animated }));
+        } catch (e) {
+          emojis = [{ error: String(e?.message || e) }];
+        }
+        try {
+          const r = await http.get({ url: `/guilds/${guildId}/stickers` });
+          stickers = (r?.body || []).map(s => ({ id: s.id, name: s.name, description: s.description, tags: s.tags, format_type: s.format_type }));
+        } catch (e) {
+          stickers = [{ error: String(e?.message || e) }];
+        }
+        return { guildId, emojis, stickers };
       },
 
       getGuildInfo: ({ guildId }) => {
